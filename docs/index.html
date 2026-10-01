@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Liked Songs Genre Sorter</title>
+  <meta name="description" content="Sort your Spotify Liked Songs into one playlist per genre.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <span class="brand">🎧 Genre Sorter</span>
+    <button class="link" id="settings-btn" hidden>Settings</button>
+  </header>
+
+  <main>
+    <!-- Logged out -->
+    <section id="screen-welcome" class="card" hidden>
+      <h1>Sort your Liked Songs by genre</h1>
+      <p class="lead">Turns your Liked Songs into tidy playlists like <em>Hip-Hop &amp; Rap</em>, <em>Indie &amp; Alternative</em> and <em>Latin</em>. You'll see a preview before anything is created.</p>
+      <button class="primary big" id="login-btn">Log in with Spotify</button>
+      <ul class="facts">
+        <li>Nothing is installed. Your music data stays in this browser.</li>
+        <li>Run it again any time. The same playlists get updated, never duplicated.</li>
+        <li>It only creates and updates its own playlists. It never changes your Liked Songs.</li>
+      </ul>
+      <p class="small" id="own-app-hint">Not set up by the person who shared this? <button class="link" data-go="setup">Use your own Spotify app</button></p>
+    </section>
+
+    <!-- Bring-your-own Client ID -->
+    <section id="screen-setup" class="card" hidden>
+      <h1>One-time setup</h1>
+      <p class="lead" id="setup-why">Spotify only lets each app be used by a handful of people, so you'll create your own free Spotify app. It takes about 3 minutes.</p>
+      <p class="note">You'll need <strong>Spotify Premium</strong>. Spotify requires it for apps like this.</p>
+      <ol class="steps">
+        <li>Open the <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">Spotify Developer Dashboard</a> and log in with your normal Spotify account. If asked, accept the developer terms.</li>
+        <li>Click <strong>Create app</strong> and fill in:
+          <ul>
+            <li><strong>App name</strong> and <strong>description</strong>: anything, e.g. "Genre Sorter"</li>
+            <li><strong>Redirect URI</strong>: paste this exactly, then click <strong>Add</strong>:
+              <div class="copy-row"><code id="redirect-uri"></code><button class="secondary" id="copy-uri">Copy</button></div>
+            </li>
+            <li>Under "Which API/SDKs", tick <strong>Web API</strong></li>
+          </ul>
+          Tick the terms box and click <strong>Save</strong>.</li>
+        <li>On your new app's page, copy the <strong>Client ID</strong> and paste it here:
+          <div class="copy-row"><input id="client-id-input" placeholder="32 letters and numbers" autocomplete="off" spellcheck="false"><button class="primary" id="save-client-id">Continue</button></div>
+          <p class="error" id="client-id-error" hidden></p>
+        </li>
+      </ol>
+      <p class="small"><button class="link" data-go="welcome" id="setup-back">← Back</button></p>
+    </section>
+
+    <!-- Logged in but not on the allowlist -->
+    <section id="screen-not-allowed" class="card" hidden>
+      <h1>Almost there</h1>
+      <p class="lead">Spotify hasn't given this account access to the shared app yet.</p>
+      <p>Either:</p>
+      <ul class="facts">
+        <li><span id="ask-owner">Ask the person who shared this link</span> to add the email of your Spotify account under <em>User Management</em> in their Spotify developer dashboard. Then try again.</li>
+        <li>Or set up your own free Spotify app in about 3 minutes.</li>
+      </ul>
+      <div class="row">
+        <button class="primary" data-go="setup">Set up my own app</button>
+        <button class="secondary" id="retry-btn">Try again</button>
+      </div>
+    </section>
+
+    <!-- Working -->
+    <section id="screen-progress" class="card" hidden>
+      <h1 id="progress-title">Reading your Liked Songs…</h1>
+      <div class="bar"><div id="progress-fill"></div></div>
+      <p id="progress-text" class="muted"></p>
+      <p class="small muted" id="progress-hint"></p>
+    </section>
+
+    <!-- Preview -->
+    <section id="screen-preview" hidden>
+      <div class="card">
+        <h1>Your genres</h1>
+        <p class="lead" id="summary"></p>
+        <div class="row between">
+          <span class="small muted">Pick the playlists you want. Click a genre to see its songs.</span>
+          <span class="small"><button class="link" id="select-all">All</button> · <button class="link" id="select-none">None</button></span>
+        </div>
+      </div>
+      <ul id="genre-list" class="genres"></ul>
+      <div class="sticky-action">
+        <button class="primary big" id="create-btn">Create playlists</button>
+      </div>
+    </section>
+
+    <!-- Results -->
+    <section id="screen-done" hidden>
+      <div class="card">
+        <h1>Done 🎉</h1>
+        <p class="lead" id="done-summary"></p>
+        <p class="small muted">Come back after liking new songs and press the button again. These playlists will be updated, not duplicated.</p>
+      </div>
+      <div id="warnings"></div>
+      <ul id="result-list" class="genres"></ul>
+      <div class="row center"><button class="secondary" id="again-btn">Back to preview</button></div>
+    </section>
+
+    <!-- Spotify lockout -->
+    <section id="screen-cooldown" class="card" hidden>
+      <h1>Spotify needs a break</h1>
+      <p class="lead">Spotify has paused this app for a while because it asked for a lot of data quickly. This is normal the first time a big library is sorted.</p>
+      <p class="note" id="cooldown-when"></p>
+      <p id="cooldown-progress"></p>
+      <p class="small muted">These pauses can last a few hours, and asking again too early can make them longer, so we've stopped for now. You can close this tab; nothing is lost.</p>
+      <button class="secondary" id="cooldown-retry">Try now anyway</button>
+    </section>
+
+    <!-- Error -->
+    <section id="screen-error" class="card" hidden>
+      <h1>Something went wrong</h1>
+      <p id="error-text" class="error"></p>
+      <p class="small muted">Nothing was duplicated. Running again picks up where this left off.</p>
+      <button class="primary" id="error-retry">Try again</button>
+    </section>
+  </main>
+
+  <dialog id="settings">
+    <form method="dialog">
+      <h2>Settings</h2>
+      <label>Playlist name prefix
+        <input id="opt-prefix" placeholder="Liked · ">
+      </label>
+      <label class="check"><input type="checkbox" id="opt-public"> Make new playlists public</label>
+      <label>Last.fm API key <span class="muted">(optional)</span>
+        <input id="opt-lastfm" placeholder="Fills genres Spotify doesn't have" autocomplete="off" spellcheck="false">
+        <span class="small muted">Free from <a href="https://www.last.fm/api/account/create" target="_blank" rel="noopener">last.fm/api</a>. Helps with small artists.</span>
+      </label>
+      <hr>
+      <p class="small muted" id="app-source"></p>
+      <div class="row wrap">
+        <button type="button" class="secondary" data-go="setup" id="change-app">Use a different Spotify app</button>
+        <button type="button" class="secondary" id="refresh-genres">Re-check artist genres</button>
+        <button type="button" class="secondary danger" id="logout">Log out</button>
+      </div>
+      <div class="row end"><button class="primary" value="close">Save</button></div>
+    </form>
+  </dialog>
+
+  <footer class="small muted">Not affiliated with Spotify. Runs entirely in your browser.</footer>
+</body>
+</html>
