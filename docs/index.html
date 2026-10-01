@@ -104,6 +104,31 @@
       <div class="row center"><button class="secondary" id="again-btn">Back to preview</button></div>
     </section>
 
+    <!-- Groq key -->
+    <section id="screen-groq" class="card" hidden>
+      <h1>One more step: a free Groq key</h1>
+      <p class="lead">Spotify only lets apps look up a few artists before it blocks them, so genres are worked out by Groq, a free AI service. It reads your artist names and tags them the way Spotify would.</p>
+      <ol class="steps">
+        <li>Sign in at <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a> (free, no credit card).</li>
+        <li>Click <strong>Create API Key</strong>, give it any name, and copy it.</li>
+        <li>Paste it here:
+          <div class="copy-row"><input id="groq-key-input" placeholder="gsk_…" autocomplete="off" spellcheck="false"><button class="primary" id="save-groq-key">Continue</button></div>
+          <p class="error" id="groq-error" hidden></p>
+        </li>
+      </ol>
+      <p class="small muted">Only artist names and a few song titles are sent to Groq. Your key stays in this browser and is only ever sent to Groq.</p>
+    </section>
+
+    <!-- Groq daily allowance used up -->
+    <section id="screen-budget" class="card" hidden>
+      <h1>Groq's free allowance is used up for today</h1>
+      <p class="lead">Your library is big, so sorting it takes more than one day of Groq's free allowance. Nothing is lost.</p>
+      <p class="note" id="budget-when"></p>
+      <p id="budget-progress"></p>
+      <p class="small muted">You can make playlists now with what's sorted. The rest stays aside, and running again later adds it to the same playlists. Nothing gets duplicated.</p>
+      <button class="primary" id="budget-continue">Continue with what's sorted</button>
+    </section>
+
     <!-- Spotify lockout -->
     <section id="screen-cooldown" class="card" hidden>
       <h1>Spotify needs a break</h1>
@@ -130,15 +155,29 @@
         <input id="opt-prefix" placeholder="Liked · ">
       </label>
       <label class="check"><input type="checkbox" id="opt-public"> Make new playlists public</label>
+      <label>Groq API key
+        <input id="opt-groq-key" placeholder="gsk_…" autocomplete="off" spellcheck="false">
+        <span class="small muted">Free from <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>. Used to work out genres.</span>
+      </label>
+      <label>Groq model
+        <input id="opt-groq-model" list="groq-models" autocomplete="off" spellcheck="false">
+        <datalist id="groq-models">
+          <option value="llama-3.3-70b-versatile"></option>
+          <option value="openai/gpt-oss-120b"></option>
+          <option value="llama-3.1-8b-instant"></option>
+          <option value="openai/gpt-oss-20b"></option>
+        </datalist>
+        <span class="small muted">The larger models know more artists. Change it if Groq retires the one in use.</span>
+      </label>
       <label>Last.fm API key <span class="muted">(optional)</span>
-        <input id="opt-lastfm" placeholder="Fills genres Spotify doesn't have" autocomplete="off" spellcheck="false">
+        <input id="opt-lastfm" placeholder="Fills in artists Groq doesn't know" autocomplete="off" spellcheck="false">
         <span class="small muted">Free from <a href="https://www.last.fm/api/account/create" target="_blank" rel="noopener">last.fm/api</a>. Helps with small artists.</span>
       </label>
       <hr>
       <p class="small muted" id="app-source"></p>
       <div class="row wrap">
         <button type="button" class="secondary" data-go="setup" id="change-app">Use a different Spotify app</button>
-        <button type="button" class="secondary" id="refresh-genres">Re-check artist genres</button>
+        <button type="button" class="secondary" id="refresh-genres">Sort all artists again</button>
         <button type="button" class="secondary danger" id="logout">Log out</button>
       </div>
       <div class="row end"><button class="primary" value="close">Save</button></div>
