@@ -138,3 +138,12 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
   .card { padding: 18px; }
   h1 { font-size: 1.35rem; }
 }
+
+.step { font-size: .75rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0 0 .4rem; }
+.step:empty { display: none; }
+.success { background: var(--accent-soft); border-radius: 10px; padding: 10px 14px; margin: 0 0 1rem; font-weight: 500; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 1.25rem 0; }
+.stats > div { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 2px; }
+.stat { font-size: 1.4rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+#budget-fill { height: 100%; width: 0; background: var(--accent); }
+@media (max-width: 480px) { .stats { grid-template-columns: 1fr; } }

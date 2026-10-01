@@ -70,15 +70,32 @@
 
     <!-- Working -->
     <section id="screen-progress" class="card" hidden>
+      <p class="step" id="progress-step"></p>
       <h1 id="progress-title">Reading your Liked Songs…</h1>
       <div class="bar"><div id="progress-fill"></div></div>
-      <p id="progress-text" class="muted"></p>
+      <p id="progress-text"></p>
       <p class="small muted" id="progress-hint"></p>
+      <p class="small muted">You can switch to another tab while this runs. This tab's title shows the progress and changes to ✓ when it's done. Closing it loses nothing; open the page again to continue.</p>
+    </section>
+
+    <!-- Estimate shown before a long sort -->
+    <section id="screen-plan" class="card" hidden>
+      <p class="step">Step 2 of 3 · Working out genres</p>
+      <h1>Before we start</h1>
+      <p class="lead" id="plan-lead"></p>
+      <div class="stats">
+        <div><span class="stat" id="plan-artists"></span><span class="small muted">artists to sort</span></div>
+        <div><span class="stat" id="plan-time"></span><span class="small muted" id="plan-time-label">estimated time</span></div>
+        <div><span class="stat" id="plan-days"></span><span class="small muted">of Groq's free allowance</span></div>
+      </div>
+      <p class="note" id="plan-note"></p>
+      <button class="primary big" id="plan-start">Start sorting</button>
     </section>
 
     <!-- Preview -->
     <section id="screen-preview" hidden>
       <div class="card">
+        <p class="success" id="ready-banner" hidden></p>
         <h1>Your genres</h1>
         <p class="lead" id="summary"></p>
         <div class="row between">
@@ -121,11 +138,16 @@
 
     <!-- Groq daily allowance used up -->
     <section id="screen-budget" class="card" hidden>
+      <p class="step" id="budget-day"></p>
       <h1>Groq's free allowance is used up for today</h1>
-      <p class="lead">Your library is big, so sorting it takes more than one day of Groq's free allowance. Nothing is lost.</p>
-      <p class="note" id="budget-when"></p>
+      <p class="lead">Your library needs more than one day of Groq's free allowance. Everything sorted so far is saved.</p>
+      <div class="bar"><div id="budget-fill"></div></div>
       <p id="budget-progress"></p>
-      <p class="small muted">You can make playlists now with what's sorted. The rest stays aside, and running again later adds it to the same playlists. Nothing gets duplicated.</p>
+      <ol class="steps">
+        <li><strong>Now:</strong> make playlists with what's sorted, or just close this tab. Unsorted songs are kept aside, not put in the wrong playlist.</li>
+        <li id="budget-when"></li>
+        <li><strong>Each run adds to the same playlists.</strong> Nothing is duplicated, and songs never end up in two playlists.</li>
+      </ol>
       <button class="primary" id="budget-continue">Continue with what's sorted</button>
     </section>
 
