@@ -1,0 +1,25 @@
+{
+  "_comment": "Spotify tags artists with very specific micro-genres (e.g. 'chicago drill', 'bedroom pop'). Each bucket becomes one playlist. A micro-genre goes to the FIRST bucket whose keyword appears anywhere in it, so specific buckets come before broad ones (K-Pop before Pop, Indie before Rock/Pop). 'id' is how an existing playlist is recognised on later runs: you can rename a bucket freely, but changing its id makes a new playlist.",
+  "buckets": [
+    {"id": "christian-gospel", "name": "Christian & Gospel", "keywords": ["christian", "gospel", "worship", "ccm"]},
+    {"id": "k-pop-j-pop", "name": "K-Pop & J-Pop", "keywords": ["k-pop", "kpop", "j-pop", "jpop", "korean", "japanese", "anime", "j-rock", "k-rap", "city pop", "vocaloid"]},
+    {"id": "latin", "name": "Latin", "keywords": ["latin", "reggaeton", "bachata", "salsa", "cumbia", "corrido", "banda", "mariachi", "urbano", "mexican", "sertanejo", "brazilian", "bossa nova", "mpb", "tango", "flamenco", "dembow", "merengue", "sierre", "norteñ", "funk carioca", "baile funk"]},
+    {"id": "afrobeats", "name": "Afrobeats", "keywords": ["afrobeat", "afropop", "afro", "amapiano", "african", "highlife", "naija", "azonto"]},
+    {"id": "hip-hop-rap", "name": "Hip-Hop & Rap", "keywords": ["hip hop", "hip-hop", "rap", "trap", "drill", "grime", "boom bap", "phonk", "crunk"]},
+    {"id": "rb-soul", "name": "R&B & Soul", "keywords": ["r&b", "rnb", "soul", "funk", "motown", "quiet storm", "new jack swing"]},
+    {"id": "metal", "name": "Metal", "keywords": ["metal", "djent", "deathcore", "grindcore", "doom", "sludge"]},
+    {"id": "punk-emo", "name": "Punk & Emo", "keywords": ["punk", "emo", "screamo", "hardcore", "post-hardcore"]},
+    {"id": "country", "name": "Country", "keywords": ["country", "americana", "bluegrass", "honky tonk", "red dirt", "outlaw"]},
+    {"id": "folk-acoustic", "name": "Folk & Acoustic", "keywords": ["folk", "singer-songwriter", "acoustic"]},
+    {"id": "classical", "name": "Classical", "keywords": ["classical", "orchestra", "opera", "baroque", "chamber music", "choral", "string quartet", "romantic era", "compositional"]},
+    {"id": "jazz", "name": "Jazz", "keywords": ["jazz", "swing", "bebop", "big band"]},
+    {"id": "reggae-dancehall", "name": "Reggae & Dancehall", "keywords": ["reggae", "dancehall", "ska", "lovers rock", "rocksteady"]},
+    {"id": "soundtracks", "name": "Soundtracks", "keywords": ["soundtrack", "score", "video game", "broadway", "show tunes", "musical"]},
+    {"id": "chill-lo-fi", "name": "Chill & Lo-Fi", "keywords": ["lo-fi", "lofi", "chill", "ambient", "sleep", "study", "new age"]},
+    {"id": "indie-alternative", "name": "Indie & Alternative", "keywords": ["indie", "alternative", "alt z", "alt-", "shoegaze", "dream pop", "bedroom pop", "post-punk", "slowcore"]},
+    {"id": "rock", "name": "Rock", "keywords": ["rock", "grunge", "britpop", "permanent wave"]},
+    {"id": "pop", "name": "Pop", "keywords": ["pop", "boy band", "girl group", "teen", "adult standards"]},
+    {"id": "electronic-dance", "name": "Electronic & Dance", "keywords": ["edm", "house", "techno", "trance", "dubstep", "drum and bass", "dnb", "electro", "electronic", "dance", "bass music", "hardstyle", "breakbeat", "synthwave", "idm", "downtempo", "future bass", "uk garage", "jersey club"]},
+    {"id": "blues", "name": "Blues", "keywords": ["blues"]}
+  ]
+}
