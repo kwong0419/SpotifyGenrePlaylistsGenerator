@@ -5,8 +5,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
-  createClient, fetchLikedTracks, fetchArtistGenres, RateLimitedError, dedupeTracks, groupTracks,
-  syncPlaylists, classifyTrack, UNCATEGORIZED,
+  createClient, fetchLikedTracks, RateLimitedError, dedupeTracks, groupTracks,
+  syncPlaylists, classifyTrack, UNCATEGORIZED, NOT_SORTED_YET,
 } from "../docs/core.js";
 
 import { FakeSpotify, ME } from "./fake-spotify.mjs";
@@ -33,17 +33,27 @@ function fakeClient(spotify, extra = {}) {
   });
 }
 
+// Artist genres come from Groq in the app; here the fake library's genres stand in for them.
 async function run(spotify, remembered = {}, { prefix = "Liked · " } = {}) {
   const api = fakeClient(spotify);
   const { tracks: liked } = await fetchLikedTracks(api);
   const { tracks } = dedupeTracks(liked);
-  const genres = await fetchArtistGenres(api, tracks, {}, BUCKETS);
-  const groups = groupTracks(tracks, genres, BUCKETS).filter((g) => g.bucket.id !== "uncategorized");
+  const groups = groupTracks(tracks, spotify.artists, BUCKETS).filter((g) => g.bucket.id !== "uncategorized");
   return syncPlaylists(api, {
     userId: ME, groups, nameFor: (b) => prefix + b.name, isPublic: false, remembered,
-    remember: (id, pid) => { remembered[id] = { id: pid, createdAt: Date.now() }; }, verifyDelayMs: 0,
+    remember: (id, info) => { remembered[id] = { ...remembered[id], ...info }; }, verifyDelayMs: 0,
   });
 }
+
+/** Looks artists up one by one, standing in for any run of Spotify requests. */
+async function lookUp(api, ids, cache = {}, concurrency = 1) {
+  const queue = [...ids];
+  await Promise.all(Array.from({ length: concurrency }, async () => {
+    while (queue.length) { const id = queue.shift(); cache[id] = (await api.request("GET", `/artists/${id}`)).genres; }
+  }));
+  return cache;
+}
+const ARTISTS = ["rapper", "indie", "latin", "nogenre"];
 
 function assertNoDuplicates(spotify) {
   const names = [...spotify.followed].map((id) => spotify.playlists.get(id).name);
@@ -158,7 +168,7 @@ test("a short slow-down is waited out with two careful retries", async () => {
   const api = fakeClient(sp, { onWait: (ms) => waits.push(ms) });
   const { tracks } = await fetchLikedTracks(api);
   sp.rateLimitNext = 2;
-  await fetchArtistGenres(api, tracks, {}, BUCKETS);
+  await lookUp(api, ARTISTS);
   assert.equal(waits.length, 2);
   assert.ok(waits[0] >= 30_000 && waits[0] < 33_000, `first wait covers a full 30s window: ${waits[0]}`);
   assert.ok(waits[1] >= 60_000 && waits[1] < 63_000, `second wait is longer: ${waits[1]}`);
@@ -169,12 +179,12 @@ test("a lockout stops at once, sends nothing more, and keeps what was found", as
   const api = fakeClient(sp);
   const { tracks } = await fetchLikedTracks(api);
   const cache = {};
-  await fetchArtistGenres(api, tracks.slice(0, 1), cache, BUCKETS);
+  await lookUp(api, ["rapper"], cache);
   sp.rateLimitNext = 1000;
   let sent = 0;
   const realFetch = sp.fetch;
   sp.fetch = (...a) => { sent++; return realFetch(...a); };
-  const err = await fetchArtistGenres(api, tracks, cache, BUCKETS).catch((e) => e);
+  const err = await lookUp(api, ARTISTS, cache).catch((e) => e);
   assert.ok(err instanceof RateLimitedError, String(err));
   assert.equal(err.retryAfterMs, null, "browsers can't read Retry-After");
   assert.ok(sent <= 4, `only a couple of probes during a lockout, sent ${sent}`);
@@ -190,7 +200,7 @@ test("refusals for requests already in flight count once, not as a lockout", asy
   const api = fakeClient(sp, { onWait: (ms) => waits.push(ms) });
   const { tracks } = await fetchLikedTracks(api);
   sp.rateLimitNext = 3; // three parallel requests all refused at the same moment
-  const cache = await fetchArtistGenres(api, tracks, {}, BUCKETS, { concurrency: 3 });
+  const cache = await lookUp(api, ARTISTS, {}, 3);
   assert.equal(Object.keys(cache).length, 4);
   assert.equal(waits.length, 1, `one pause, not a lockout: ${waits}`);
 });
@@ -225,23 +235,6 @@ test("a resumed run reuses saved Liked Songs when nothing changed", async () => 
   assert.ok(calls > 1);
 });
 
-test("only main artists are looked up unless a song needs its featured artists", async () => {
-  const sp = new FakeSpotify({
-    liked: [
-      track(0, "A", "rapper", { artists: [{ id: "rapper", name: "r" }, { id: "feat1", name: "f1" }] }),
-      track(1, "B", "nogenre", { artists: [{ id: "nogenre", name: "n" }, { id: "feat2", name: "f2" }] }),
-    ],
-    artists: { rapper: ["rap"], nogenre: [], feat1: ["pop"], feat2: ["pop"] },
-  });
-  const api = fakeClient(sp);
-  const { tracks } = await fetchLikedTracks(api);
-  const cache = await fetchArtistGenres(api, tracks, {}, BUCKETS);
-  assert.deepEqual(Object.keys(cache).sort(), ["feat2", "nogenre", "rapper"]); // feat1 never needed
-  assert.equal(sp.artistLookups, 3);
-  await fetchArtistGenres(api, tracks, cache, BUCKETS);
-  assert.equal(sp.artistLookups, 3, "a second run looks nothing up again");
-});
-
 test("requests are spaced out, and spacing grows after a slow-down", async () => {
   const sp = new FakeSpotify(library(40));
   const slept = [];
@@ -250,6 +243,73 @@ test("requests are spaced out, and spacing grows after a slow-down", async () =>
     minGapMs: 100, startGapMs: 200, sleepImpl: async (ms) => { slept.push(ms); },
   });
   const { tracks } = await fetchLikedTracks(api);
-  await fetchArtistGenres(api, tracks, {}, BUCKETS, { concurrency: 1 });
+  await lookUp(api, ARTISTS);
   assert.ok(slept.length > 0, "requests waited for their turn");
+});
+
+test("Spotify's QUOTA_EXCEEDED stops at once, without any retries", async () => {
+  const sp = new FakeSpotify(library());
+  sp.quotaExceeded = true;
+  const waits = [];
+  const api = fakeClient(sp, { onWait: (ms) => waits.push(ms) });
+  const err = await api.request("GET", "/me/tracks?limit=50").catch((e) => e);
+  assert.ok(err instanceof RateLimitedError && err.quota, String(err));
+  assert.equal(sp.log.length, 1, "one request, no retries");
+  assert.equal(waits.length, 0);
+});
+
+test("re-runs leave unchanged playlists alone", async () => {
+  const sp = new FakeSpotify(library());
+  const remembered = {};
+  await run(sp, remembered);
+  sp.log = [];
+  const { results } = await run(sp, remembered);
+  assert.ok(results.every((r) => r.unchanged));
+  assert.ok(!sp.log.some((l) => /^(PUT|POST) \/playlists/.test(l)), `no writes: ${sp.log}`);
+  const playlistRequests = sp.log.filter((l) => !l.startsWith("GET /me/tracks"));
+  assert.deepEqual(playlistRequests, ["GET /me/playlists"], "one request to check every playlist");
+});
+
+test("a playlist edited in Spotify, or with new songs, is rewritten exactly", async () => {
+  const sp = new FakeSpotify(library());
+  const remembered = {};
+  await run(sp, remembered);
+  sp.userAdds("pl1", "spotify:track:t0");      // someone added a song by hand
+  sp.liked.unshift(track(900, "New Rap Song", "rapper"));
+  await run(sp, remembered);
+  assertNoDuplicates(sp);
+  assert.equal(sp.playlists.get("pl1").items.length, 62, "hand-added song replaced by the sorted list");
+  assert.equal(sp.playlists.get("pl2").items[0], "spotify:track:t900");
+});
+
+test("a clean write is checked with one count request; a troubled one is read back in full", async () => {
+  const sp = new FakeSpotify(library(400));
+  await run(sp);
+  assert.ok(!sp.log.some((l) => /^GET \/playlists\/\w+\/items/.test(l)), "clean writes don't read every song");
+  const sp2 = new FakeSpotify(library(1200));
+  sp2.failAfterApply = 1;
+  await run(sp2);
+  assert.ok(sp2.log.some((l) => /^GET \/playlists\/\w+\/items/.test(l)), "after a failure, songs are read back");
+  assertNoDuplicates(sp2);
+});
+
+test("a song's own genre beats its artist's, and unsorted artists are set aside", () => {
+  const tracks = [
+    { uri: "a", name: "Rap One", artistIds: ["post"], artistNames: ["Post"] },
+    { uri: "b", name: "Rock One", artistIds: ["post"], artistNames: ["Post"] },
+    { uri: "c", name: "Later", artistIds: ["new"], artistNames: ["New"] },
+  ];
+  const groups = groupTracks(tracks, { post: ["melodic rap"] }, BUCKETS, {
+    songGenres: { b: ["alternative rock", "rock"] },
+    isPending: (t) => t.artistIds[0] === "new",
+  });
+  const where = Object.fromEntries(groups.flatMap((g) => g.tracks.map((t) => [t.uri, g.bucket.id])));
+  assert.deepEqual(where, { a: "hip-hop-rap", b: "indie-alternative", c: NOT_SORTED_YET.id });
+});
+
+test("a tie between genres goes to the tag listed first", () => {
+  const t = { uri: "x", artistIds: ["a"], artistNames: ["A"] };
+  assert.equal(classifyTrack(t, { a: ["pop", "country pop"] }, BUCKETS).id, "pop");
+  assert.equal(classifyTrack(t, { a: ["country pop", "pop"] }, BUCKETS).id, "country");
+  assert.equal(classifyTrack(t, { a: ["pop", "dance pop", "edm"] }, BUCKETS).id, "pop", "most votes still wins");
 });

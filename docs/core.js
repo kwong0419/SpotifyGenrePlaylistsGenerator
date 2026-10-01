@@ -8,6 +8,9 @@
 
 export const API = "https://api.spotify.com/v1";
 export const UNCATEGORIZED = { id: "uncategorized", name: "Uncategorized", keywords: [] };
+// Songs whose artist hasn't been sorted yet (e.g. Groq's daily allowance ran out). Never
+// turned into a playlist; they're sorted on a later run.
+export const NOT_SORTED_YET = { id: "not-sorted-yet", name: "Not sorted yet", keywords: [] };
 const RECENT_CREATE_MS = 60 * 60 * 1000;
 
 export class SpotifyError extends Error {
@@ -30,9 +33,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * read it (Spotify doesn't expose Retry-After to web pages).
  */
 export class RateLimitedError extends SpotifyError {
-  constructor(retryAfterMs) {
-    super(429, "Spotify has paused this app for sending too many requests.");
+  constructor(retryAfterMs, { quota = false } = {}) {
+    super(429, quota
+      ? "Spotify says this developer account has used up its request quota for now."
+      : "Spotify has paused this app for sending too many requests.");
     this.retryAfterMs = retryAfterMs;
+    // QUOTA_EXCEEDED: the account's allowance is used up (observed to last ~20 hours),
+    // as opposed to a short burst over the rate limit.
+    this.quota = quota;
   }
 }
 
@@ -99,6 +107,15 @@ export function createClient({
         // A request already in flight when the pause began isn't a new refusal: just wait.
         if (sentInPause < pauseNo) continue;
         pauseNo++;
+        // Spotify labels quota refusals in the body (which, unlike Retry-After, browsers can
+        // read). Waiting a few seconds never helps with those, so stop straight away.
+        let reason = "";
+        try { const b = JSON.parse(await resp.text()); reason = b?.error?.reason || b?.reason || ""; } catch { /* no body */ }
+        if (/QUOTA_EXCEEDED/i.test(reason)) {
+          const h = parseInt(resp.headers.get("Retry-After") || "", 10);
+          lockedOut = new RateLimitedError(h > 0 ? (h + 1) * 1000 : null, { quota: true });
+          throw lockedOut;
+        }
         gap = Math.min(maxGapMs, gap * 2);
         okStreak = 0;
         consecutive429++;
@@ -181,40 +198,6 @@ export async function fetchLikedTracks(api, onProgress = () => {}, saved = null)
   return { tracks, snapshot: { total: first.total, firstUris, tracks } };
 }
 
-/**
- * Fills `cache` (artist id -> genres[]) with what the tracks need, mutating it.
- *
- * Spotify only allows one artist per request now, so lookups are kept to a minimum:
- * a song is sorted by its main artist, so only main artists are looked up first.
- * Featured artists are looked up only for songs whose main artist gave no usable genre.
- * `onSaved` is called after each artist so progress survives a stop or a reload.
- */
-export async function fetchArtistGenres(api, tracks, cache, buckets, {
-  onProgress = () => {}, onSaved = () => {}, concurrency = 1,
-} = {}) {
-  let done = 0;
-  let total = 0;
-  async function lookUp(ids) {
-    const queue = [...new Set(ids)].filter((id) => !(id in cache));
-    total += queue.length;
-    async function worker() {
-      while (queue.length) {
-        const id = queue.shift();
-        const artist = await api.request("GET", `/artists/${id}`);
-        cache[id] = artist.genres || [];
-        onSaved(cache);
-        onProgress(++done, total);
-      }
-    }
-    await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, worker));
-  }
-
-  await lookUp(tracks.map((t) => t.artistIds[0]).filter(Boolean));
-  const sortable = (id) => (cache[id] || []).some((g) => bucketForGenre(g, buckets));
-  await lookUp(tracks.filter((t) => !sortable(t.artistIds[0])).flatMap((t) => t.artistIds.slice(1)));
-  return cache;
-}
-
 // --------------------------------------------------------------------------- sorting
 
 export function bucketForGenre(genre, buckets) {
@@ -222,19 +205,32 @@ export function bucketForGenre(genre, buckets) {
   return buckets.find((b) => b.keywords.some((k) => g.includes(k.toLowerCase()))) || null;
 }
 
-/** The single bucket a track belongs to: the one most of its main artist's genres map to. */
-export function classifyTrack(track, artistGenres, buckets) {
-  // Featured artists are only consulted when the main artist has no usable genres.
+/**
+ * The bucket most of these genre tags map to, or null. A tie goes to the bucket of the
+ * earliest tag, since tags are listed most representative first.
+ */
+export function bucketForTags(tags, buckets) {
+  const votes = new Map(); // insertion order = order of first appearance in the tags
+  for (const g of tags || []) {
+    const b = bucketForGenre(g, buckets);
+    if (b) votes.set(b, (votes.get(b) || 0) + 1);
+  }
+  if (!votes.size) return null;
+  const top = Math.max(...votes.values());
+  return [...votes].find(([, n]) => n === top)[0];
+}
+
+/**
+ * The single bucket a track belongs to. A song's own tags win (used for artists whose
+ * songs span different genres); otherwise its main artist's tags decide, with featured
+ * artists consulted only when the main artist has nothing usable.
+ */
+export function classifyTrack(track, artistGenres, buckets, songGenres = {}) {
+  const own = bucketForTags(songGenres[track.uri], buckets);
+  if (own) return own;
   for (const aid of track.artistIds) {
-    const votes = new Map();
-    for (const g of artistGenres[aid] || []) {
-      const b = bucketForGenre(g, buckets);
-      if (b) votes.set(b.id, (votes.get(b.id) || 0) + 1);
-    }
-    if (votes.size) {
-      const top = Math.max(...votes.values());
-      return buckets.find((b) => votes.get(b.id) === top); // ties go to the earlier bucket
-    }
+    const b = bucketForTags(artistGenres[aid], buckets);
+    if (b) return b;
   }
   return UNCATEGORIZED;
 }
@@ -269,10 +265,17 @@ export function dedupeTracks(tracks) {
   return { tracks: kept, removed };
 }
 
-/** bucket id -> { bucket, tracks[] } in genres.json order, Uncategorized last. */
-export function groupTracks(tracks, artistGenres, buckets) {
-  const groups = new Map([...buckets, UNCATEGORIZED].map((b) => [b.id, { bucket: b, tracks: [] }]));
-  for (const t of tracks) groups.get(classifyTrack(t, artistGenres, buckets).id).tracks.push(t);
+/**
+ * bucket id -> { bucket, tracks[] } in genres.json order, then Uncategorized, then
+ * Not sorted yet (tracks for which `isPending(track)` is true).
+ */
+export function groupTracks(tracks, artistGenres, buckets, { songGenres = {}, isPending = () => false } = {}) {
+  const all = [...buckets, UNCATEGORIZED, NOT_SORTED_YET];
+  const groups = new Map(all.map((b) => [b.id, { bucket: b, tracks: [] }]));
+  for (const t of tracks) {
+    const bucket = isPending(t) ? NOT_SORTED_YET : classifyTrack(t, artistGenres, buckets, songGenres);
+    groups.get(bucket.id).tracks.push(t);
+  }
   return [...groups.values()].filter((g) => g.tracks.length);
 }
 
@@ -293,7 +296,7 @@ const descriptionFor = (bucket) =>
  * More than one match means duplicates already exist; we use one and report the rest
  * rather than deleting anything.
  *
- * `remembered` is bucket id -> { id, createdAt } saved by this browser.
+ * `remembered` is bucket id -> { id, createdAt, snapshot, hash } saved by this browser.
  */
 export async function resolvePlaylists(api, userId, buckets, nameFor, remembered = {}, now = Date.now()) {
   const owned = (await getAllPages(api, "/me/playlists?limit=50"))
@@ -309,7 +312,7 @@ export async function resolvePlaylists(api, userId, buckets, nameFor, remembered
     const mem = remembered[bucket.id];
     if (matches.length) {
       const chosen = matches.find((p) => p.id === mem?.id) || matches[0];
-      result.set(bucket.id, { playlistId: chosen.id, isNew: false });
+      result.set(bucket.id, { playlistId: chosen.id, isNew: false, snapshot: chosen.snapshot_id, name: chosen.name });
       const extras = matches.filter((p) => p !== chosen);
       if (extras.length) {
         warnings.push({ bucket, keptId: chosen.id, extraIds: extras.map((p) => p.id) });
@@ -333,33 +336,61 @@ async function readPlaylistUris(api, playlistId) {
   return items.map((e) => (e.item || e.track)?.uri).filter(Boolean);
 }
 
+/** The playlist's song count with one request, or null if Spotify didn't include it. */
+async function readPlaylistCount(api, playlistId) {
+  const p = await api.request("GET", `/playlists/${playlistId}?fields=items(total),tracks(total)`);
+  const total = p?.items?.total ?? p?.tracks?.total;
+  return typeof total === "number" ? total : null;
+}
+
 const sameList = (a, b) => a.length === b.length && a.every((u, i) => u === b[i]);
+
+/** A short fingerprint of a song list, to tell whether a playlist needs rewriting. */
+export function listHash(uris) {
+  let h = 0x811c9dc5;
+  for (const ch of uris.join("\n")) h = Math.imul(h ^ ch.charCodeAt(0), 0x01000193) >>> 0;
+  return `${uris.length}:${h.toString(36)}`;
+}
 
 /**
  * Makes the playlist contain exactly `uris`, in order, once each.
  * The first 100 go in with a replace (PUT), which wipes whatever was there, so a re-run
- * or a retry after a half-finished run can never stack songs twice. Then we read the
- * playlist back; if it doesn't match exactly, the whole thing is rewritten.
+ * or a retry after a half-finished run can never stack songs twice.
+ *
+ * Checking afterwards: a clean write is confirmed with the song count (1 request; a
+ * doubled-up add would show as too many songs). If anything went wrong on the way,
+ * every song is read back and compared. Either way a mismatch means a full rewrite.
+ * Returns { snapshot } (Spotify's version id after the write).
  */
 export async function writePlaylist(api, playlistId, uris, { verifyDelayMs = 800 } = {}) {
   uris = [...new Set(uris)];
   let lastProblem = "";
+  let troubled = false;
   for (let attempt = 1; attempt <= 3; attempt++) {
+    let snapshot = null;
     try {
-      await api.request("PUT", `/playlists/${playlistId}/items`, { uris: uris.slice(0, 100) });
+      snapshot = (await api.request("PUT", `/playlists/${playlistId}/items`, { uris: uris.slice(0, 100) }))?.snapshot_id;
       for (let i = 100; i < uris.length; i += 100) {
-        await api.request("POST", `/playlists/${playlistId}/items`, { uris: uris.slice(i, i + 100) });
+        snapshot = (await api.request("POST", `/playlists/${playlistId}/items`, { uris: uris.slice(i, i + 100) }))?.snapshot_id ?? snapshot;
       }
     } catch (err) {
       if (!(err instanceof SpotifyError) || !err.ambiguous) throw err;
       lastProblem = err.message; // unknown whether it applied: start over with a replace
+      troubled = true;
       continue;
     }
-    // Spotify can take a moment to reflect a write, so re-read once before rewriting.
+    // Spotify can take a moment to reflect a write, so re-check once before rewriting.
     for (const wait of [verifyDelayMs, verifyDelayMs * 3]) {
       await sleep(wait);
+      const count = troubled ? null : await readPlaylistCount(api, playlistId);
+      if (count !== null) {
+        if (count === uris.length) return { snapshot };
+        lastProblem = `playlist has ${count} songs, expected ${uris.length}`;
+        troubled = true;
+        continue;
+      }
       const actual = await readPlaylistUris(api, playlistId);
-      if (sameList(actual, uris)) return { attempts: attempt };
+      if (sameList(actual, uris)) return { snapshot };
       lastProblem = `playlist has ${actual.length} songs, expected ${uris.length}`;
     }
   }
@@ -367,9 +398,12 @@ export async function writePlaylist(api, playlistId, uris, { verifyDelayMs = 800
 }
 
 /**
- * Creates/updates one playlist per selected group. `remember(bucketId, playlistId)` is
- * called the moment a playlist is created so even a crash right after can't lead to
- * a second one being made next time.
+ * Creates/updates one playlist per selected group.
+ *
+ * `remember(bucketId, info)` saves { id, createdAt } the moment a playlist is created, so
+ * even a crash right after can't lead to a second one next time, and { snapshot, hash }
+ * after each write. A playlist whose songs haven't changed and that nobody has edited
+ * since (same Spotify version id) is left alone, which keeps re-runs to a few requests.
  */
 export async function syncPlaylists(api, {
   userId, groups, nameFor, isPublic, remembered, remember, onStep = () => {}, verifyDelayMs,
@@ -380,8 +414,20 @@ export async function syncPlaylists(api, {
   const results = [];
   for (const [i, g] of groups.entries()) {
     const target = targets.get(g.bucket.id);
+    const uris = g.tracks.map((t) => t.uri);
+    const hash = listHash([...new Set(uris)]);
+    const mem = remembered[g.bucket.id];
     onStep({ phase: "writing", index: i, total: groups.length, bucket: g.bucket });
+
     let playlistId = target.playlistId;
+    if (playlistId && mem?.id === playlistId && mem.hash === hash && mem.snapshot && mem.snapshot === target.snapshot) {
+      if (target.name !== nameFor(g.bucket)) {
+        await api.request("PUT", `/playlists/${playlistId}`, { name: nameFor(g.bucket), description: descriptionFor(g.bucket) });
+        remember(g.bucket.id, { snapshot: null }); // a rename can change the version id; recheck next time
+      }
+      results.push({ bucket: g.bucket, playlistId, count: g.tracks.length, isNew: false, unchanged: true });
+      continue;
+    }
     if (playlistId) {
       await api.request("PUT", `/playlists/${playlistId}`, {
         name: nameFor(g.bucket), description: descriptionFor(g.bucket),
@@ -391,9 +437,10 @@ export async function syncPlaylists(api, {
         name: nameFor(g.bucket), public: isPublic, description: descriptionFor(g.bucket),
       });
       playlistId = created.id;
-      remember(g.bucket.id, playlistId);
+      remember(g.bucket.id, { id: playlistId, createdAt: Date.now() });
     }
-    await writePlaylist(api, playlistId, g.tracks.map((t) => t.uri), { verifyDelayMs });
+    const { snapshot } = await writePlaylist(api, playlistId, uris, { verifyDelayMs });
+    remember(g.bucket.id, { id: playlistId, snapshot, hash });
     results.push({ bucket: g.bucket, playlistId, count: g.tracks.length, isNew: target.isNew });
   }
   return { results, warnings };
