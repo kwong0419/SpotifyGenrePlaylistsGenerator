@@ -15,7 +15,10 @@ The first visit walks you through two one-time steps, about 5 minutes in total:
    because Spotify requires it for these apps.
 2. **A Groq API key** (free, no credit card) from [console.groq.com/keys](https://console.groq.com/keys).
 
-After that it's *Log in with Spotify → preview your genres → Create playlists*.
+After that it's *Log in with Spotify → preview your genres → Create playlists*. Before a long sort the
+page shows how many artists there are, roughly how long it will take and whether it needs more than
+one day of Groq's free allowance. While it runs, the tab's title shows the progress and turns into ✓
+when it's done.
 
 ## How genres are worked out
 
@@ -56,6 +59,10 @@ library takes about 350 Spotify requests on the first run and only a handful aft
   if anything went wrong on the way); it's rewritten if it isn't exactly right.
   Each song goes into exactly one genre, and the same song liked from two releases (single vs. album,
   remaster) is included once.
+- **No song in two playlists.** A song can move genre on a later run (for example when a big library
+  finishes sorting on day 2), so every genre playlist the app has made is kept up to date on each run,
+  ticked or not, and emptied if all its songs moved elsewhere. To stop a playlist being updated,
+  delete it in Spotify.
 - Only one run at a time: the button locks, and a second browser tab is refused.
 
 ## Hosting your own copy (one time, about 10 minutes)
