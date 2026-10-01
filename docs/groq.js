@@ -60,7 +60,7 @@ function parseTryAgain(message) {
  */
 export function createGroq({
   apiKey, model, fetchImpl = fetch, sleepImpl = sleep, now = () => Date.now(),
-  ledger, onWait = () => {}, limits,
+  ledger, onWait = () => {}, onPace = () => {}, limits,
 }) {
   let lim = { ...(limits || MODEL_LIMITS[model] || UNKNOWN_MODEL_LIMITS) };
   const caps = () => ({
@@ -114,6 +114,7 @@ export function createGroq({
       if (m.minute + estimated <= c.tpm && m.minuteRequests + 1 <= c.rpm) return;
       const oldest = Math.min(...m.list.filter((e) => e.t > now() - 60_000).map((e) => e.t));
       const wait = Math.max(1000, oldest + 60_000 - now() + 250);
+      onPace(wait); // a planned pause to stay under the per-minute limit, not a problem
       await sleepImpl(wait);
     }
   }
@@ -204,7 +205,7 @@ export function createGroq({
     /** For progress messages: rough tokens/minute we allow ourselves, and what's left today. */
     budget() {
       const c = caps();
-      return { tpm: c.tpm, dayLeft: Math.max(0, c.tpd - usage().day) };
+      return { tpm: c.tpm, tpd: c.tpd, dayLeft: Math.max(0, c.tpd - usage().day) };
     },
   };
 }
@@ -228,6 +229,22 @@ const SONG_PROMPT = `You tag individual songs with genres the way Spotify would.
 For each numbered song, give 1-2 Spotify-style genre tags describing that specific song (not the artist in general), lowercase, e.g. "pop rap", "alternative rock", "contemporary country", "dance pop".
 If you don't confidently know the song, give an empty list. Never guess.
 Reply with JSON only, in this shape: {"tags":{"1":["tag"],"2":[]}}`;
+
+/**
+ * Roughly how long tagging these artists will take and how much of the daily allowance
+ * it needs: { tokens, minutes, days } where days > 1 means it continues on later days.
+ */
+export function estimateArtistJob(groq, artists, batchSize = 80) {
+  const perBatch = estimateTokens(ARTIST_PROMPT) + 40;
+  const tokens = artists.reduce((n, a) => n + estimateTokens(artistLine(a)) + 3 + 16, 0)
+    + Math.ceil(artists.length / batchSize) * perBatch;
+  const { tpm, tpd, dayLeft } = groq.budget();
+  const today = Math.min(tokens, dayLeft);
+  const days = tokens <= dayLeft ? 1 : 1 + Math.ceil((tokens - dayLeft) / tpd);
+  // Pacing allows `tpm` tokens a minute; replies take time too, so add a little.
+  const minutes = Math.ceil((today / tpm) * 1.15 + 0.5);
+  return { tokens, minutes, days, todayShare: tokens ? today / tokens : 1 };
+}
 
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 const cleanTags = (v) => (Array.isArray(v) ? v : [])
@@ -281,6 +298,8 @@ async function runBatches(groq, items, { prompt, line, key, batchSize, outPerIte
   for (let i = 0; i < items.length; i += batchSize) await attempt(items.slice(i, i + batchSize));
 }
 
+const artistLine = (a) => `${clip(a.name, 60)}${a.titles.length ? ` (songs: ${a.titles.map((t) => clip(t, 35)).join("; ")})` : ""}`;
+
 /**
  * Tags artists not yet in `cache` (artist id -> { tags, mixed }), mutating it.
  * `artists` is [{ id, name, titles, songCount }]; artists with the most liked songs go
@@ -292,7 +311,7 @@ export async function tagArtists(groq, artists, cache, { batchSize = 80, onProgr
   onProgress(0, todo.length);
   await runBatches(groq, todo, {
     prompt: ARTIST_PROMPT, batchSize, outPerItem: 16, key: (a) => a.id,
-    line: (a) => `${clip(a.name, 60)}${a.titles.length ? ` (songs: ${a.titles.map((t) => clip(t, 35)).join("; ")})` : ""}`,
+    line: artistLine,
     onBatch: (results) => {
       Object.assign(cache, results);
       done += Object.keys(results).length;

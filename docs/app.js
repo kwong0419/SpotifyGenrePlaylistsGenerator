@@ -1,10 +1,10 @@
 import { CONFIG } from "./config.js";
 import {
   createClient, fetchLikedTracks, dedupeTracks, groupTracks, bucketForTags,
-  resolvePlaylists, syncPlaylists, SpotifyError, RateLimitedError, UNCATEGORIZED, NOT_SORTED_YET,
+  resolvePlaylists, syncPlaylists, planSync, SpotifyError, RateLimitedError, UNCATEGORIZED, NOT_SORTED_YET,
 } from "./core.js";
 import {
-  createGroq, chooseModel, tagArtists, tagSongs, GroqError, GroqDailyLimitError, PREFERRED_MODELS,
+  createGroq, chooseModel, tagArtists, tagSongs, estimateArtistJob, GroqError, GroqDailyLimitError, PREFERRED_MODELS,
 } from "./groq.js";
 
 const ACCOUNTS = "https://accounts.spotify.com";
@@ -41,17 +41,57 @@ const nameFor = (bucket) => prefix() + bucket.name;
 // --------------------------------------------------------------------------- screens
 
 function show(name) {
+  const changing = $(`screen-${name}`).hidden;
   document.querySelectorAll("main > section").forEach((s) => { s.hidden = s.id !== `screen-${name}`; });
   $("settings-btn").hidden = !store.get("token");
-  window.scrollTo(0, 0);
+  if (changing) window.scrollTo(0, 0);
 }
 
-function progress(title, done, total, text = "") {
+const APP_TITLE = "Genre Sorter";
+const STEPS = { read: "Step 1 of 3 · Reading your library", sort: "Step 2 of 3 · Working out genres", save: "Step 3 of 3 · Saving playlists" };
+
+function progress(title, done, total, text = "", step = "") {
   show("progress");
+  $("progress-step").textContent = step;
   $("progress-title").textContent = title;
-  $("progress-fill").style.width = total ? `${Math.min(100, (done / total) * 100)}%` : "8%";
+  const pct = total ? Math.min(100, Math.round((done / total) * 100)) : null;
+  $("progress-fill").style.width = pct === null ? "8%" : `${pct}%`;
   $("progress-text").textContent = text;
-  $("progress-hint").textContent = "";
+  // The tab title shows progress, so it can be followed from another tab.
+  document.title = `${pct === null ? "…" : `${pct}%`} · ${title.replace(/…$/, "")} — ${APP_TITLE}`;
+}
+
+function minutesText(ms) {
+  const min = Math.round(ms / 60000);
+  return min < 1 ? "less than a minute" : `${min} minute${min === 1 ? "" : "s"}`;
+}
+
+/**
+ * A progress line whose time left and time so far tick every second, even while waiting
+ * between batches. Time left is the larger of the estimate's remaining share and the pace
+ * measured so far: the first batches go out at once, before pacing kicks in, so the
+ * measured pace alone would promise too much early on.
+ */
+let liveTimer = null;
+function liveProgress(title, unit, estimateMs, step) {
+  const start = Date.now();
+  let done = 0;
+  let total = 0;
+  const render = () => {
+    const elapsed = Date.now() - start;
+    const share = total ? (total - done) / total : 1;
+    const byPace = done && elapsed > 20000 ? (elapsed / done) * (total - done) : 0;
+    const left = Math.max(estimateMs * share, byPace);
+    progress(title, done, total, `${done.toLocaleString()} of ${total.toLocaleString()} ${unit} · `
+      + `${done >= total ? "finishing up" : left < 60000 ? "less than a minute left" : `about ${minutesText(left)} left`} · `
+      + `${minutesText(elapsed)} so far`, step);
+  };
+  clearInterval(liveTimer);
+  liveTimer = setInterval(render, 1000);
+  return {
+    update(d, t) { done = d; total = t; render(); },
+    stop() { clearInterval(liveTimer); },
+  };
 }
 
 function showError(err) {
@@ -162,14 +202,15 @@ async function getToken() {
 
 // Shows a live countdown while Spotify has asked us to pause.
 let pauseTimer = null;
-function showPause(ms, service = "Spotify") {
+function showPause(ms, service = "Spotify", planned = false) {
   const until = Date.now() + ms;
   clearInterval(pauseTimer);
   const tick = () => {
     const left = Math.ceil((until - Date.now()) / 1000);
     if (left <= 0) { clearInterval(pauseTimer); $("progress-hint").textContent = ""; return; }
-    $("progress-hint").textContent =
-      `${service} limits how quickly apps can ask for data, so we're taking a short break. Resuming in ${left}s. Your progress is saved.`;
+    $("progress-hint").textContent = planned
+      ? `⏳ Pacing to stay inside Groq's free limit. Next batch in ${left}s. This is expected and already counted in the time left.`
+      : `${service} limits how quickly apps can ask for data, so we're taking a short break. Resuming in ${left}s. Your progress is saved.`;
   };
   tick();
   pauseTimer = setInterval(tick, 1000);
@@ -186,6 +227,7 @@ function groqClient(key = store.get("groqKey", ""), model = store.get("groqModel
     // Shared by every tab via localStorage, so the daily budget holds across reloads.
     ledger: { load: () => store.get("groqLedger", []), save: (e) => store.set("groqLedger", e) },
     onWait: (ms) => showPause(ms, "Groq"),
+    onPace: (ms) => showPause(ms, "Groq", true),
   });
 }
 
@@ -267,7 +309,8 @@ function scan() {
 }
 
 async function scanLibrary() {
-  progress("Connecting to Spotify…", 0, 0);
+  state.sortedMs = null;
+  progress("Connecting to Spotify…", 0, 0, "", STEPS.read);
   try {
     state.me = await api.request("GET", "/me");
   } catch (err) {
@@ -280,7 +323,7 @@ async function scanLibrary() {
 
   // A saved copy of Liked Songs is reused when nothing changed, so resuming costs 1 request.
   const { tracks: liked, snapshot } = await fetchLikedTracks(api, (n, total) =>
-    progress("Reading your Liked Songs…", n, total, `${n.toLocaleString()} of ${total.toLocaleString()} songs`),
+    progress("Reading your Liked Songs…", n, total, `${n.toLocaleString()} of ${total.toLocaleString()} songs`, STEPS.read),
     store.get("liked", null));
   store.set("liked", snapshot);
   const { tracks, removed } = dedupeTracks(liked);
@@ -309,22 +352,38 @@ async function scanLibrary() {
 
   try {
     const need = [...artists.values()].filter((a) => !sortable(spotifyGenres[a.id]));
-    await tagArtists(groq, need, artistTags, {
-      onProgress: (done, total) => progress("Sorting your artists…", done, total,
-        `${done.toLocaleString()} of ${total.toLocaleString()} artists · ${timeLeft((total - done) * 30 / groq.budget().tpm * 60000)}. `
-        + "Only needed the first time; later runs just sort new artists. You can leave this tab in the background."),
-      onSaved: (c) => saveThrottled("artistTags", c),
-    });
+    const todo = need.filter((a) => !(a.id in artistTags));
+    const estimate = estimateArtistJob(groq, todo);
+    if (estimate.minutes >= 3 || estimate.days > 1) {
+      await confirmPlan(estimate, todo.length, need.length - todo.length);
+    }
+    const startedAt = Date.now();
+    const artistLine = liveProgress("Sorting your artists…", "artists", estimate.minutes * 60000, STEPS.sort);
+    try {
+      await tagArtists(groq, need, artistTags, {
+        onProgress: (done, total) => artistLine.update(done, total),
+        onSaved: (c) => saveThrottled("artistTags", c),
+      });
+    } finally {
+      artistLine.stop();
+    }
 
     // Artists whose songs span different genres: sort those songs one by one.
     const songs = tracks
       .filter((t) => artistTags[t.artistIds[0]]?.mixed)
       .map((t) => ({ uri: t.uri, title: t.name, artist: t.artistNames[0] }));
-    await tagSongs(groq, songs, songTags, {
-      onProgress: (done, total) => progress("Sorting songs by artists who mix genres…", done, total,
-        `${done.toLocaleString()} of ${total.toLocaleString()} songs · ${timeLeft((total - done) * 24 / groq.budget().tpm * 60000)}`),
-      onSaved: (c) => saveThrottled("songTags", c),
-    });
+    const songsLeft = songs.filter((x) => !(x.uri in songTags)).length;
+    const songLine = liveProgress("Sorting songs by artists who mix genres…", "songs",
+      ((songsLeft * 24) / groq.budget().tpm) * 60000 * 1.15, STEPS.sort);
+    try {
+      await tagSongs(groq, songs, songTags, {
+        onProgress: (done, total) => songLine.update(done, total),
+        onSaved: (c) => saveThrottled("songTags", c),
+      });
+    } finally {
+      songLine.stop();
+    }
+    state.sortedMs = Date.now() - startedAt;
   } catch (err) {
     if (!(err instanceof GroqDailyLimitError)) throw err;
     paused = err;
@@ -346,7 +405,7 @@ async function scanLibrary() {
     const need = [...artists.values()].filter((a) => a.id in artistTags && !sortable(genres[a.id]) && !(a.id in lfm));
     try {
       for (const [i, a] of need.entries()) {
-        progress("Filling in missing genres from Last.fm…", i, need.length, `${i} of ${need.length} artists`);
+        progress("Filling in missing genres from Last.fm…", i, need.length, `${i} of ${need.length} artists`, STEPS.sort);
         const tags = await lastfmTags(a.name, lastfmKey);
         if (tags) lfm[a.id] = tags;
         if (i % 25 === 0) store.set("lastfmTags", lfm);
@@ -366,6 +425,7 @@ async function scanLibrary() {
     .map((g) => g.bucket.id));
   state.groqResumeAt = paused?.resumeAt || null;
 
+  if (!paused) store.del("groqDays"); // fully sorted: a future multi-day run starts at day 1
   if (paused) {
     const unsorted = [...artists.keys()].filter((id) => !sortable(spotifyGenres[id]) && !(id in artistTags)).length;
     return showGroqPaused(paused, artists.size - unsorted, artists.size);
@@ -373,14 +433,42 @@ async function scanLibrary() {
   return showPreview();
 }
 
-/** Groq's daily allowance ran out: say when it resets, and offer to go ahead with what's sorted. */
+/** Before a long sort: how many artists, roughly how long, and whether it spans days. Waits for Start. */
+function confirmPlan(estimate, todo, alreadySorted) {
+  $("plan-lead").textContent = alreadySorted
+    ? `Picking up where you left off: ${alreadySorted.toLocaleString()} artists are already sorted.`
+    : "Groq will tag each of your artists with genres, the way Spotify does. This only happens once; later runs just sort newly liked artists.";
+  $("plan-artists").textContent = todo.toLocaleString();
+  $("plan-time").textContent = `~${estimate.minutes} min`;
+  $("plan-time-label").textContent = estimate.days > 1 ? "estimated time today" : "estimated time";
+  $("plan-days").textContent = estimate.days > 1 ? `${estimate.days} days` : "1 day";
+  $("plan-note").textContent = estimate.days > 1
+    ? `Your library will probably need more than one day of Groq's free allowance, so at least ${Math.round(estimate.todayShare * 100)}% gets sorted today, `
+      + "artists with the most songs first. You can make playlists right away and run again on the following days to sort the rest. "
+      + "Nothing is duplicated."
+    : "You can switch to another tab while it runs. The tab's title shows the progress and changes to ✓ when it's done.";
+  document.title = `Ready to start — ${APP_TITLE}`;
+  show("plan");
+  return new Promise((resolve) => { $("plan-start").onclick = () => resolve(); });
+}
+
+/** Groq's daily allowance ran out: show how far along we are, when it resets, and what to do. */
 function showGroqPaused(err, sortedArtists, totalArtists) {
   const pendingSongs = state.groups.find((g) => g.bucket.id === NOT_SORTED_YET.id)?.tracks.length || 0;
-  $("budget-when").textContent = `Groq's free allowance frees up again after ${formatWhen(err.resumeAt)}.`;
+  const sortedSongs = state.total - pendingSongs;
+  const daysDone = store.get("groqDays", 0) + 1;
+  store.set("groqDays", daysDone);
+  $("budget-day").textContent = `Day ${daysDone} done`;
+  $("budget-fill").style.width = `${Math.round((sortedSongs / Math.max(1, state.total)) * 100)}%`;
   $("budget-progress").textContent = pendingSongs
-    ? `${sortedArtists.toLocaleString()} of ${totalArtists.toLocaleString()} artists are sorted, covering `
-      + `${(state.total - pendingSongs).toLocaleString()} of ${state.total.toLocaleString()} songs. Artists with the most songs went first.`
-    : "All your artists are sorted. A few songs by artists who mix genres will be fine-tuned next time.";
+    ? `${sortedSongs.toLocaleString()} of ${state.total.toLocaleString()} songs sorted `
+      + `(${sortedArtists.toLocaleString()} of ${totalArtists.toLocaleString()} artists; the ones with the most songs went first).`
+    : `All ${state.total.toLocaleString()} songs have a genre. A few songs by artists who mix genres will be fine-tuned next time.`;
+  $("budget-when").innerHTML = "";
+  const strong = document.createElement("strong");
+  strong.textContent = `After ${formatWhen(err.resumeAt)}:`;
+  $("budget-when").append(strong, " open this page again. It continues where it stopped, without asking Groq about anything already sorted.");
+  document.title = `Paused until ${formatWhen(err.resumeAt)} — ${APP_TITLE}`;
   show("budget");
 }
 
@@ -388,11 +476,6 @@ function formatWhen(ts) {
   const when = new Date(ts);
   const time = when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   return when.toDateString() === new Date().toDateString() ? time : `${time} tomorrow`;
-}
-
-function timeLeft(ms) {
-  const min = Math.round(ms / 60000);
-  return min < 1 ? "less than a minute left" : `about ${min} minute${min === 1 ? "" : "s"} left`;
 }
 
 // --------------------------------------------------------------------------- Spotify lockouts
@@ -433,9 +516,9 @@ function showNotAllowed() {
 // --------------------------------------------------------------------------- preview
 
 async function showPreview() {
-  progress("Checking your existing playlists…", 0, 0);
+  progress("Checking your existing playlists…", 0, 0, "", STEPS.save);
   try {
-    const { targets } = await resolvePlaylists(api, state.me.id, state.groups.map((g) => g.bucket), nameFor,
+    const { targets } = await resolvePlaylists(api, state.me.id, [...state.buckets, UNCATEGORIZED], nameFor,
       store.get("playlists", {}));
     state.targets = targets;
   } catch {
@@ -445,6 +528,14 @@ async function showPreview() {
 }
 
 function renderPreview() {
+  const pendingAll = state.groups.find((g) => g.bucket.id === NOT_SORTED_YET.id)?.tracks.length || 0;
+  $("ready-banner").hidden = false;
+  $("ready-banner").textContent = pendingAll
+    ? `✓ Sorting is done for today. ${(state.total - pendingAll).toLocaleString()} of ${state.total.toLocaleString()} songs have a genre.`
+    : state.sortedMs > 60000
+      ? `✓ Sorting finished in ${minutesText(state.sortedMs)}. Review your genres, then create your playlists.`
+      : "✓ Your library is sorted. Review your genres, then create your playlists.";
+  document.title = `✓ Ready to review — ${APP_TITLE}`;
   const uncategorized = state.groups.find((g) => g.bucket.id === UNCATEGORIZED.id)?.tracks.length || 0;
   const genreCount = state.groups.filter((g) => ![UNCATEGORIZED.id, NOT_SORTED_YET.id].includes(g.bucket.id)).length;
   const parts = [`${state.total.toLocaleString()} songs in ${genreCount} genres.`];
@@ -457,8 +548,13 @@ function renderPreview() {
   }
   $("summary").textContent = parts.join(" ");
 
+  // Genres that already have a playlist but no songs now (they all moved elsewhere).
+  const shown = new Set(state.groups.map((g) => g.bucket.id));
+  const emptied = [...state.buckets, UNCATEGORIZED]
+    .filter((b) => !shown.has(b.id) && state.targets.get(b.id) && !state.targets.get(b.id).isNew)
+    .map((bucket) => ({ bucket, tracks: [] }));
   const list = $("genre-list");
-  list.replaceChildren(...state.groups.map(genreRow));
+  list.replaceChildren(...[...state.groups, ...emptied].map(genreRow));
   updateCreateButton();
   show("preview");
 }
@@ -481,6 +577,14 @@ function genreRow(group) {
   box.checked = state.selected.has(bucket.id);
   box.setAttribute("aria-label", `Include ${bucket.name}`);
   if (bucket.id === NOT_SORTED_YET.id) box.disabled = true; // never made into a playlist
+  // A playlist made on an earlier run is always kept up to date, so a song that moved
+  // genre can't be left behind in it. To drop it, delete it in Spotify.
+  const keptUpToDate = state.targets.get(bucket.id) && !state.targets.get(bucket.id).isNew;
+  if (keptUpToDate) {
+    box.checked = true;
+    box.disabled = true;
+    box.title = "Already created, so it's kept up to date. Delete it in Spotify to stop.";
+  }
   box.addEventListener("change", () => {
     box.checked ? state.selected.add(bucket.id) : state.selected.delete(bucket.id);
     li.classList.toggle("off", !box.checked);
@@ -504,12 +608,12 @@ function genreRow(group) {
   } else if (target && !target.isNew) {
     const badge = document.createElement("span");
     badge.className = "badge";
-    badge.textContent = "Updates existing";
+    badge.textContent = tracks.length ? "Kept up to date" : "Will be emptied";
     name.append(badge);
   }
   const meta = document.createElement("div");
   meta.className = "meta";
-  meta.textContent = topArtists(tracks);
+  meta.textContent = tracks.length ? topArtists(tracks) : "Its songs now belong to other genres.";
   text.append(name, meta);
 
   const count = document.createElement("span");
@@ -536,11 +640,18 @@ function genreRow(group) {
   return li;
 }
 
+function syncPlan() {
+  return planSync(state.groups, state.targets, state.selected, state.buckets);
+}
+
 function updateCreateButton() {
-  const n = state.selected.size;
+  const n = syncPlan().length;
   const btn = $("create-btn");
   btn.disabled = n === 0;
-  btn.textContent = n === 0 ? "Pick at least one genre" : `Create ${n} playlist${n === 1 ? "" : "s"}`;
+  const existing = syncPlan().filter((g) => state.targets.get(g.bucket.id) && !state.targets.get(g.bucket.id).isNew).length;
+  btn.textContent = n === 0 ? "Pick at least one genre"
+    : existing === n ? `Update ${n} playlist${n === 1 ? "" : "s"}`
+      : `Create ${n - existing}${existing ? ` and update ${existing}` : ""} playlist${n === 1 ? "" : "s"}`;
 }
 
 // --------------------------------------------------------------------------- creating playlists
@@ -562,7 +673,10 @@ async function create() {
 }
 
 async function runSync() {
-  const groups = state.groups.filter((g) => state.selected.has(g.bucket.id));
+  // Re-resolved inside syncPlaylists; this just decides which genres to write.
+  const { targets } = await resolvePlaylists(api, state.me.id, [...state.buckets, UNCATEGORIZED], nameFor, store.get("playlists", {}));
+  state.targets = targets;
+  const groups = syncPlan();
   const remembered = store.get("playlists", {});
   const { results, warnings } = await syncPlaylists(api, {
     userId: state.me.id,
@@ -575,8 +689,8 @@ async function runSync() {
       store.set("playlists", remembered);
     },
     onStep: ({ phase, index, total, bucket }) => {
-      if (phase === "checking") progress("Checking your existing playlists…", 0, 0);
-      else progress(`Saving ${bucket.name}…`, index, total, `Playlist ${index + 1} of ${total}`);
+      if (phase === "checking") progress("Checking your existing playlists…", 0, 0, "", STEPS.save);
+      else progress(`Saving ${bucket.name}…`, index, total, `Playlist ${index + 1} of ${total}`, STEPS.save);
     },
   });
   showDone(results, warnings);
@@ -590,14 +704,16 @@ function showDone(results, warnings) {
   if (made) bits.push(`${made} new playlist${made === 1 ? "" : "s"} created`);
   if (updated) bits.push(`${updated} updated`);
   if (same) bits.push(`${same} already up to date`);
-  $("done-summary").textContent = `${bits.join(", ")}. Every song appears once.`;
+  $("done-summary").textContent = `${bits.join(", ")}. Every song appears in exactly one playlist.`;
+  document.title = `✓ Playlists ready — ${APP_TITLE}`;
 
   $("result-list").replaceChildren(...results.map((r) => {
     const li = document.createElement("li");
     li.className = "genre";
     li.innerHTML = `<div class="genre-head"><div class="text"><div class="name"></div><div class="meta"></div></div><a class="open" target="_blank" rel="noopener">Open ↗</a></div>`;
     li.querySelector(".name").textContent = nameFor(r.bucket);
-    li.querySelector(".meta").textContent = `${r.count.toLocaleString()} songs · ${r.isNew ? "new" : r.unchanged ? "no changes" : "updated"}`;
+    li.querySelector(".meta").textContent = r.count === 0 ? "emptied: its songs moved to other genres"
+      : `${r.count.toLocaleString()} songs · ${r.isNew ? "new" : r.unchanged ? "no changes" : "updated"}`;
     li.querySelector("a").href = `https://open.spotify.com/playlist/${r.playlistId}`;
     return li;
   }));
