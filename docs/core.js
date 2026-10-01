@@ -398,7 +398,28 @@ export async function writePlaylist(api, playlistId, uris, { verifyDelayMs = 800
 }
 
 /**
- * Creates/updates one playlist per selected group.
+ * Which groups to write. Ticked genres get a playlist; genres that already have one are
+ * always kept up to date, ticked or not, and emptied if all their songs moved elsewhere.
+ * Otherwise a song that moved (say from Country to Pop when its own genre was worked out
+ * on a later run) would be left behind in the old playlist too. "Not sorted yet" is
+ * never written.
+ *
+ * `targets` is resolvePlaylists() output for every bucket; `buckets` is every bucket.
+ */
+export function planSync(groups, targets, selectedIds, buckets) {
+  const byId = new Map(groups.map((g) => [g.bucket.id, g]));
+  const plan = [];
+  for (const bucket of [...buckets, UNCATEGORIZED]) {
+    const existing = targets.get(bucket.id) && !targets.get(bucket.id).isNew;
+    const group = byId.get(bucket.id);
+    if (existing) plan.push(group || { bucket, tracks: [] });
+    else if (group && selectedIds.has(bucket.id)) plan.push(group);
+  }
+  return plan;
+}
+
+/**
+ * Creates/updates one playlist per group (see planSync for which groups).
  *
  * `remember(bucketId, info)` saves { id, createdAt } the moment a playlist is created, so
  * even a crash right after can't lead to a second one next time, and { snapshot, hash }

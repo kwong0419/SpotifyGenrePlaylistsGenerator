@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   createClient, fetchLikedTracks, RateLimitedError, dedupeTracks, groupTracks,
-  syncPlaylists, classifyTrack, UNCATEGORIZED, NOT_SORTED_YET,
+  syncPlaylists, classifyTrack, UNCATEGORIZED, NOT_SORTED_YET, planSync, resolvePlaylists,
 } from "../docs/core.js";
 
 import { FakeSpotify, ME } from "./fake-spotify.mjs";
@@ -312,4 +312,90 @@ test("a tie between genres goes to the tag listed first", () => {
   assert.equal(classifyTrack(t, { a: ["pop", "country pop"] }, BUCKETS).id, "pop");
   assert.equal(classifyTrack(t, { a: ["country pop", "pop"] }, BUCKETS).id, "country");
   assert.equal(classifyTrack(t, { a: ["pop", "dance pop", "edm"] }, BUCKETS).id, "pop", "most votes still wins");
+});
+
+// ---- running more than once: the app's real sequence (group -> resolve -> plan -> sync)
+
+async function appRun(sp, remembered, { artistGenres, songGenres = {}, isPending, selected }) {
+  const api = fakeClient(sp);
+  const { tracks: liked } = await fetchLikedTracks(api);
+  const { tracks } = dedupeTracks(liked);
+  const groups = groupTracks(tracks, artistGenres, BUCKETS, { songGenres, isPending });
+  const nameFor = (b) => `Liked · ${b.name}`;
+  const { targets } = await resolvePlaylists(api, ME, [...BUCKETS, UNCATEGORIZED], nameFor, remembered);
+  // Like the app: every genre ticked except Uncategorized (and Not sorted yet can't be ticked).
+  const pick = selected || new Set(groups.map((g) => g.bucket.id).filter((id) => ![NOT_SORTED_YET.id, UNCATEGORIZED.id].includes(id)));
+  const plan = planSync(groups, targets, pick, BUCKETS);
+  return syncPlaylists(api, {
+    userId: ME, groups: plan, nameFor, isPublic: false, remembered, verifyDelayMs: 0,
+    remember: (id, info) => { remembered[id] = { ...remembered[id], ...info }; },
+  });
+}
+
+/** Every liked song is in at most one of the account's playlists, and no playlist repeats a song. */
+function assertEachSongOnce(sp) {
+  assertNoDuplicates(sp);
+  const all = sp.followed.flatMap((id) => sp.playlists.get(id).items);
+  assert.equal(new Set(all).size, all.length, "a song is in two playlists");
+}
+
+function swiftLibrary() {
+  const liked = [];
+  for (let i = 0; i < 12; i++) liked.push(track(i, `Swift ${i}`, "swift"));
+  for (let i = 12; i < 20; i++) liked.push(track(i, `Bryan ${i}`, "bryan"));
+  return { liked, artists: {} };
+}
+
+test("a song that changes genre on a later run is never left in two playlists, even if unticked", async () => {
+  const sp = new FakeSpotify(swiftLibrary());
+  const remembered = {};
+  const artistGenres = { swift: ["country pop"], bryan: ["classic oklahoma country"] };
+  await appRun(sp, remembered, { artistGenres });
+  assert.equal(sp.followed.length, 1, "day 1: everything is Country");
+
+  // Day 2: Swift's songs get their own tags; most are pop. The user only ticks Pop.
+  const songGenres = Object.fromEntries([...Array(9).keys()].map((i) => [`spotify:track:t${i}`, ["pop"]]));
+  await appRun(sp, remembered, { artistGenres, songGenres, selected: new Set(["pop"]) });
+  assertEachSongOnce(sp);
+  const country = sp.playlists.get("pl1").items;
+  assert.equal(country.length, 11, "Country was updated even though it wasn't ticked");
+  assert.ok(!country.includes("spotify:track:t0"));
+});
+
+test("a genre whose songs all moved away is emptied, not left stale", async () => {
+  const sp = new FakeSpotify(swiftLibrary());
+  const remembered = {};
+  await appRun(sp, remembered, { artistGenres: { swift: ["country pop"], bryan: ["pop"] } });
+  assert.equal(sp.followed.length, 2);
+  await appRun(sp, remembered, { artistGenres: { swift: ["pop"], bryan: ["pop"] } });
+  assertEachSongOnce(sp);
+  assert.equal(sp.playlists.get("pl1").items.length, 0, "Country is now empty");
+  assert.equal(sp.playlists.get("pl2").items.length, 20);
+});
+
+test("a partial first day then a full second day uses the same playlists, every song once", async () => {
+  const lib = library(400);
+  const sp = new FakeSpotify(lib);
+  const remembered = {};
+  // Day 1: Groq ran out before "latin" and "indie" were sorted.
+  await appRun(sp, remembered, { artistGenres: lib.artists, isPending: (t) => ["latin", "indie"].includes(t.artistIds[0]) });
+  assert.equal(sp.followed.length, 1, "only Hip-Hop on day 1; Not sorted yet is never a playlist");
+  await appRun(sp, remembered, { artistGenres: lib.artists });
+  await appRun(sp, remembered, { artistGenres: lib.artists }); // and once more, for good measure
+  assertEachSongOnce(sp);
+  assert.equal(sp.creates, 3);
+  assert.equal(sp.followed.reduce((n, id) => n + sp.playlists.get(id).items.length, 0), 300);
+});
+
+test("running twice in a row changes nothing the second time", async () => {
+  const lib = library(400);
+  const sp = new FakeSpotify(lib);
+  const remembered = {};
+  await appRun(sp, remembered, { artistGenres: lib.artists });
+  const before = JSON.stringify([...sp.playlists.values()].map((p) => p.items));
+  sp.log = [];
+  const { results } = await appRun(sp, remembered, { artistGenres: lib.artists });
+  assert.ok(results.every((r) => r.unchanged));
+  assert.equal(JSON.stringify([...sp.playlists.values()].map((p) => p.items)), before);
+  assert.equal(sp.creates, 3);
 });
