@@ -2,34 +2,58 @@
 
 Sorts your **Liked Songs** into one playlist per genre (Hip-Hop & Rap, Indie & Alternative, Latin, ...)
 with the click of a button. It's a single web page, so there's nothing to install, and it runs
-entirely in the visitor's browser, so there's no server and no data leaves their device except to Spotify.
-
-Spotify doesn't tag songs with genres, only artists, so each song goes into its main artist's genre.
-Spotify's thousands of micro-genres ("chicago drill", "bedroom pop") are grouped into about 20 broad
-genres defined in [`docs/genres.json`](docs/genres.json).
+entirely in the visitor's browser: there's no server, and data only goes to Spotify and Groq.
 
 ## Use it
 
 **[kwong0419.github.io/SpotifyGenrePlaylistsGenerator](https://kwong0419.github.io/SpotifyGenrePlaylistsGenerator/)**
 
-The first visit walks you through a one-time, 3-minute setup: Spotify only lets each developer app
-be used by 5 people, so everyone creates their own free Spotify app and pastes its Client ID into the
-page. You need **Spotify Premium**, because Spotify requires it for these apps. After that it's
-*Log in with Spotify → preview your genres → Create playlists*.
+The first visit walks you through two one-time steps, about 5 minutes in total:
 
-**Large libraries:** Spotify allows one artist per request and limits how fast apps can ask, so the
-first run on a big library (thousands of artists) takes a while, and Spotify may pause the app for a
-few hours partway through. The page tells you when to come back, and everything found so far is saved.
-Later runs only look up newly liked artists.
+1. **Your own Spotify app** (free). Spotify only lets each developer app be used by 5 people, so
+   everyone creates their own and pastes its Client ID into the page. You need **Spotify Premium**,
+   because Spotify requires it for these apps.
+2. **A Groq API key** (free, no credit card) from [console.groq.com/keys](https://console.groq.com/keys).
+
+After that it's *Log in with Spotify → preview your genres → Create playlists*.
+
+## How genres are worked out
+
+Spotify only lets a development app look up a few hundred artists before it blocks the whole developer
+account for about a day. So instead of asking Spotify for each artist's genres, the app:
+
+1. Reads your Liked Songs from Spotify (50 per request; skipped if nothing changed since last time).
+2. Sends your artists' names, with a couple of song titles each, to **Groq** (a free AI service),
+   about 80 per request. The model tags each artist the way Spotify would ("chicago drill",
+   "bedroom pop"), or says it doesn't know rather than guessing.
+3. For artists whose songs span different genres (say, hip hop and rock), it tags each of their
+   songs separately, so the songs can land in different playlists.
+4. Runs the tags through the keyword rules in [`docs/genres.json`](docs/genres.json) to pick one of
+   about 20 playlists per song. Optionally, Last.fm fills in artists the model didn't know.
+
+Results are saved in your browser, so later runs only send newly liked artists. A 7,400-song
+library takes about 350 Spotify requests on the first run and only a handful after that.
+
+## Staying within the free limits
+
+- **Spotify:** requests are spaced out. A short slow-down gets two careful retries; a lockout or used-up
+  quota stops everything at once, because requests during a lockout extend it. The page shows when to
+  come back. Playlists that haven't changed aren't rewritten.
+- **Groq:** every request is budgeted against the free tier before it's sent, using at most 80% of the
+  per-minute limit and 90% of the daily limit, tracked across reloads and tabs. If a big library needs
+  more than a day's allowance, the artists with the most songs go first. You can make playlists right
+  away with what's sorted, and the rest is added to the same playlists on a later run.
+- Only one run at a time, even across tabs.
 
 ## Never any duplicates
 
 - **No duplicate playlists.** Every playlist carries a tag in its description (e.g. `[gs:hip-hop-rap]`).
   Before creating anything, the app lists the user's playlists and reuses the tagged one. That still
   works after renaming the playlist, changing the name prefix, clearing the browser, or switching
-  devices, and between the web app and the Python script.
+  devices.
 - **No duplicate songs.** Playlists are *replaced*, never appended to, so re-runs and interrupted runs
-  can't stack songs. After writing, each playlist is read back and rewritten if it isn't exactly right.
+  can't stack songs. After writing, each playlist's song count is checked (and every song is read back
+  if anything went wrong on the way); it's rewritten if it isn't exactly right.
   Each song goes into exactly one genre, and the same song liked from two releases (single vs. album,
   remaster) is included once.
 - Only one run at a time: the button locks, and a second browser tab is refused.
@@ -60,6 +84,9 @@ Then send people the link.
   3-minute setup where they create their own free Spotify app and paste its Client ID. They then use
   the same one-click flow, with no limit on how many people can do this. They need Spotify Premium.
 
+Everyone also adds their own free Groq key. A key built into the site would be visible to anyone,
+and one big library uses about half a day's free allowance.
+
 ## Running it on your computer
 
 Spotify only accepts `http` login redirects for `127.0.0.1`, so use that address rather than `localhost`:
@@ -70,39 +97,25 @@ python3 -m http.server 8765 --bind 127.0.0.1
 
 Then open `http://127.0.0.1:8765/docs/` (add that exact address as a Redirect URI in your Spotify app).
 
-To try the whole flow **without a Spotify account**, open `http://127.0.0.1:8765/tests/demo.html`.
-It runs the real app against a simulated Spotify.
+To try the whole flow **without any accounts**, open `http://127.0.0.1:8765/tests/demo.html`.
+It runs the real app against a simulated Spotify and Groq; any Groq key works there.
 
 ## Tests
 
 ```bash
-npm test                                  # web app logic (Node 18+)
-python3 -m unittest discover tests        # Python script
+npm test                                  # Node 18+
 ```
 
-They simulate Spotify misbehaving (a slow-to-update playlist list, requests that succeed but report
-an error) and check that no duplicate playlists or songs are ever created.
+They simulate Spotify and Groq misbehaving (a slow-to-update playlist list, requests that succeed but
+report an error, rate limits, used-up quotas, broken AI replies) and check that no duplicate playlists
+or songs are ever created and that neither service is pushed past its limits.
 
 ## Customizing genres
 
-Each genre in `docs/genres.json` has an `id`, a display `name` and `keywords`. A Spotify genre goes to
+Each genre in `docs/genres.json` has an `id`, a display `name` and `keywords`. A genre tag goes to
 the **first** genre with a keyword inside it, so specific genres go above broad ones (`K-Pop` above `Pop`).
-You can rename a genre freely, but changing its `id` makes a new playlist.
-
-## Command-line version
-
-[`spotify_genres.py`](spotify_genres.py) does the same from a terminal, and finds the same playlists
-as the web app.
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env                      # paste your Client ID
-python3 spotify_genres.py --dry-run       # preview
-python3 spotify_genres.py                 # create / update playlists
-python3 spotify_genres.py --list-genres   # which Spotify genre lands where
-```
-
-Its Spotify app needs the Redirect URI `http://127.0.0.1:8888/callback`.
+A song goes where most of its tags point; a tie goes to the tag listed first. You can rename a genre
+freely, but changing its `id` makes a new playlist. Changing the rules doesn't use any Groq allowance.
 
 ## License
 

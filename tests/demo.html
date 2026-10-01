@@ -16,13 +16,17 @@
   // tried without an account. Serve the repo root and open /tests/demo.html.
   // The app keeps the demo's saved data separate from the real site's.
   import { FakeSpotify, demoLibrary } from "./fake-spotify.mjs";
+  import { demoGroq } from "./fake-groq.mjs";
 
   const fake = new FakeSpotify(demoLibrary());
+  const groq = demoGroq();
   window.__fake = fake;
+  window.__groq = groq;
   window.__GS_DEMO__ = {
     sharedClientId: "demo-shared-app",
     fetch: (url, opts) =>
       String(url).startsWith("https://api.spotify.com/") ? fake.fetch(url, opts) : fetch(url, opts),
+    groqFetch: groq.fetch, // any key works in the demo
   };
   // Each page load is a fresh simulated account, so start logged out every time.
   Object.keys(localStorage).filter((k) => k.startsWith("gs-demo.")).forEach((k) => localStorage.removeItem(k));
@@ -32,7 +36,7 @@
   page.querySelectorAll("script").forEach((s) => s.remove());
   const banner = document.createElement("div");
   banner.className = "demo-banner";
-  banner.innerHTML = 'Demo with a simulated Spotify account. Nothing here touches real Spotify. The real app is at <a href="../docs/">/docs/</a>.';
+  banner.innerHTML = 'Demo with a simulated Spotify account and Groq. Nothing here touches the real services; any Groq key works. The real app is at <a href="../docs/">/docs/</a>.';
   page.body.prepend(banner);
   document.body.replaceWith(document.adoptNode(page.body));
   await import("../docs/app.js");

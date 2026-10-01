@@ -13,10 +13,12 @@ export class FakeSpotify {
     this.failAfterApply = 0;     // next N item POSTs apply, then return 502
     this.creates = 0;
     this.rateLimitNext = 0;      // next N requests get a 429 with no readable Retry-After
+    this.quotaExceeded = false;  // every request gets Spotify's QUOTA_EXCEEDED 429
     this.artistLookups = 0;
+    this.log = [];               // "METHOD /path" of every request
   }
   addPlaylist(p) {
-    const pl = { owner: { id: ME }, items: [], description: "", ...p };
+    const pl = { owner: { id: ME }, items: [], description: "", version: 0, ...p };
     this.playlists.set(pl.id, pl);
     this.followed.push(pl.id);
     return pl;
@@ -36,6 +38,10 @@ export class FakeSpotify {
     const offset = +(u.searchParams.get("offset") || 0);
     const limit = +(u.searchParams.get("limit") || 20);
     const data = body ? JSON.parse(body) : null;
+    this.log.push(`${method} ${path}`);
+    if (this.quotaExceeded) {
+      return this.json(429, { error: { status: 429, message: "Quota exceeded", reason: "QUOTA_EXCEEDED" } });
+    }
     if (this.rateLimitNext > 0) { this.rateLimitNext--; return this.json(429, { error: { message: "rate limited" } }); }
     let m;
     if (method === "GET" && path === "/me") return this.json(200, { id: ME, display_name: "Test User" });
@@ -43,7 +49,7 @@ export class FakeSpotify {
     if (method === "GET" && (m = path.match(/^\/artists\/(\w+)$/)) && ++this.artistLookups) return this.json(200, { id: m[1], name: m[1], genres: this.artists[m[1]] || [] });
     if (method === "GET" && path === "/me/playlists") {
       const visible = this.followed.filter((id) => !this.hiddenFromList.has(id)).map((id) => {
-        const { items, ...meta } = this.playlists.get(id); return meta;
+        const { items, version, ...meta } = this.playlists.get(id); return { ...meta, snapshot_id: `v${version}` };
       });
       return this.json(200, this.page(visible, offset, limit, url.split("?")[0]));
     }
@@ -55,21 +61,31 @@ export class FakeSpotify {
     if ((m = path.match(/^\/playlists\/(\w+)$/))) {
       const pl = this.playlists.get(m[1]);
       if (!pl) return this.json(404, { error: { message: "not found" } });
-      if (method === "GET") return this.json(200, pl);
+      if (method === "GET") {
+        const { items, version, ...meta } = pl;
+        return this.json(200, { ...meta, snapshot_id: `v${version}`, items: { total: items.length } });
+      }
       Object.assign(pl, data); return this.json(200);
     }
     if ((m = path.match(/^\/playlists\/(\w+)\/items$/))) {
       const pl = this.playlists.get(m[1]);
       if (method === "GET") return this.json(200, this.page(pl.items.map((uri) => ({ item: { uri } })), offset, limit, url.split("?")[0]));
-      if (method === "PUT") { pl.items = [...data.uris]; return this.json(200, { snapshot_id: "s" }); }
+      if (method === "PUT") { pl.items = [...data.uris]; pl.version++; return this.json(200, { snapshot_id: `v${pl.version}` }); }
       if (method === "POST") {
         pl.items.push(...data.uris);
+        pl.version++;
         if (this.failAfterApply > 0) { this.failAfterApply--; return this.json(502); }
-        return this.json(201, { snapshot_id: "s" });
+        return this.json(201, { snapshot_id: `v${pl.version}` });
       }
     }
     return this.json(404, { error: { message: `no route ${method} ${path}` } });
   };
+  /** The user adds a song to a playlist in the Spotify app. */
+  userAdds(playlistId, uri) {
+    const pl = this.playlists.get(playlistId);
+    pl.items.push(uri);
+    pl.version++;
+  }
 }
 
 // A realistic-looking library for the browser demo.
