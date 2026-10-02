@@ -208,14 +208,17 @@ test("Groq refusing a reply as invalid JSON is retried smaller, never fatal", as
   assert.ok(Object.values(cache).every((v) => v.tags.length), "everything recovered");
 });
 
-test("one artist the model always chokes on becomes unknown; the rest are sorted", async () => {
+test("one artist the model always chokes on is left for next time; the rest are sorted", async () => {
   const { artists, list } = manyArtists(60);
   const s = setup({ groq: new FakeGroq({ artists }) });
-  s.groq.poison = "Artist 17";
+  s.groq.requests = 0;
   const cache = {};
+  await tagArtists(s.client, list.slice(0, 5), cache); // the model's format works
+  s.groq.poison = "Artist 17";
   await tagArtists(s.client, list, cache);
-  assert.deepEqual(cache.a17, { tags: [], mixed: false });
-  assert.ok(Object.keys(cache).length === 60);
+  assert.ok(!("a17" in cache), "never saved as unknown; asked again next run");
+  assert.equal(Object.keys(cache).length, 59);
+  assert.ok(s.groq.requests < 25, `narrowed down cheaply: ${s.groq.requests} requests`);
   assert.equal(Object.values(cache).filter((v) => v.tags.length).length, 59);
 });
 
@@ -246,4 +249,29 @@ test("chatter around the answers is ignored", async () => {
   await tagArtists(s.client, list, cache);
   assert.equal(Object.values(cache).filter((v) => v.tags.length).length, 20);
   assert.equal(groq.requests, 1);
+});
+
+test("replies the app can't read are never saved as unknown, and stop the run early", async () => {
+  const { artists, list } = manyArtists(300);
+  const groq = new FakeGroq({ artists });
+  groq.garbleNext = 1000; // every reply is prose
+  const s = setup({ groq });
+  const cache = {};
+  const err = await tagArtists(s.client, list, cache).catch((e) => e);
+  assert.ok(err instanceof GroqError && err.kind === "format", String(err));
+  assert.match(err.message, /I'm sorry/, "shows what the model said");
+  assert.equal(Object.keys(cache).length, 0, "nothing saved");
+  assert.ok(groq.requests <= 3, `stopped after ${groq.requests} requests (the batch and two single-artist checks)`);
+});
+
+test("artists the model skips are asked again, then left for next run rather than marked unknown", async () => {
+  const { artists, list } = manyArtists(30);
+  const groq = new FakeGroq({ artists });
+  groq.dropEvery = 0;
+  groq.skip = new Set(["Artist 4", "Artist 9"]); // never answered
+  const s = setup({ groq });
+  const cache = {};
+  await tagArtists(s.client, list, cache);
+  assert.equal(Object.keys(cache).length, 28);
+  assert.ok(!("a4" in cache) && !("a9" in cache));
 });

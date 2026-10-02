@@ -56,6 +56,7 @@ export class FakeGroq {
     lines.forEach((line, i) => {
       const n = i + 1;
       if (this.dropEvery && n % this.dropEvery === 0) return;
+      if (this.skip && [...this.skip].some((name) => line.includes(`${name} (`) || line.endsWith(name))) return;
       const song = /^\d+\. "(.*)" by (.*)$/.exec(line);
       if (song) { answers.push(`${n}: ${(this.songs[song[1]] || []).join(", ")}`); return; }
       const name = /^\d+\. (.*?)(?: \(songs: .*\))?$/.exec(line)[1];

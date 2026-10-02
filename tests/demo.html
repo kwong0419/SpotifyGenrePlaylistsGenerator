@@ -53,7 +53,7 @@
   Object.keys(localStorage).filter((k) => k.startsWith("gs-demo.")).forEach((k) => localStorage.removeItem(k));
   // ?usedToday=N pretends N Groq tokens were already used today, to see the multi-day screens.
   const usedToday = +new URLSearchParams(location.search).get("usedToday");
-  if (usedToday) localStorage.setItem("gs-demo.groqLedger", JSON.stringify([{ t: Date.now() - 36e5, tokens: usedToday }]));
+  if (usedToday) localStorage.setItem("gs-demo.groqLedger:llama-3.3-70b-versatile", JSON.stringify([{ t: Date.now() - 36e5, tokens: usedToday }]));
 
   const html = await (await fetch("../docs/index.html", { cache: "no-store" })).text();
   const page = new DOMParser().parseFromString(html, "text/html");
@@ -68,7 +68,7 @@
     next.textContent = "Simulate next day";
     next.style.marginLeft = "8px";
     next.onclick = () => {
-      localStorage.setItem("gs-demo.groqLedger", "[]");
+      Object.keys(localStorage).filter((k) => k.startsWith("gs-demo.groqLedger")).forEach((k) => localStorage.removeItem(k));
       localStorage.removeItem("gs-demo.cooldown");
       document.getElementById("retry-btn").click();
     };

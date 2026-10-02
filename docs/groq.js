@@ -211,8 +211,9 @@ export function createGroq({
       if (typeof text !== "string") throw new GroqError("bad_output", "Groq's reply had no text");
       // Cut off at the length limit: the last line may be half-written, so drop it and let
       // that item be asked again rather than saving a truncated tag.
-      if (data.choices[0].finish_reason === "length") text = text.slice(0, Math.max(0, text.lastIndexOf("\n")));
-      return text;
+      const cutOff = data.choices[0].finish_reason === "length";
+      if (cutOff) text = text.slice(0, Math.max(0, text.lastIndexOf("\n")));
+      return { text, cutOff };
     },
     /** For progress messages: rough tokens/minute we allow ourselves, and what's left today. */
     budget() {
@@ -299,46 +300,88 @@ export function parseReplyLines(text) {
 }
 
 /**
- * Runs `items` through the model in batches, splitting a batch in half when the reply is
- * unusable or too large, down to single items. Items still unanswered are reported as
- * unknown (empty tags). `onBatch(results)` gets { key: { tags, mixed } } after each batch.
+ * Runs `items` through the model in batches. `onBatch(results)` gets { key: { tags, mixed } }
+ * for every item the model actually answered; a blank answer means "unknown".
+ *
+ * Items the model didn't answer are never saved: they're asked again (up to twice) and
+ * otherwise left for the next run, so a reply the app couldn't read can't turn into a
+ * permanent "unknown". A batch is split in half when Groq refuses it or its reply can't be
+ * read (retrying it unchanged is pointless: with temperature 0 the model says the same
+ * again), which narrows a problem down to the item causing it.
+ *
+ * To avoid burning the allowance on a reply format the app can't read: until a readable
+ * reply has been seen, an unreadable one is followed by two single-item questions. If
+ * neither is readable either, it's the format, not the batch, and sorting stops with a
+ * snippet of the reply. It also stops after 8 unreadable replies in a row.
  */
 async function runBatches(groq, items, { prompt, line, key, batchSize, outPerItem, onBatch }) {
-  async function attempt(batch) {
+  let readableSeen = false;
+  let streak = 0;
+
+  const formatError = (text) => new GroqError("format", "Sorting stopped to save your Groq allowance: the model's "
+    + `replies aren't in the expected format. It replied: "${text.trim().replace(/\s+/g, " ").slice(0, 160) || "(nothing)"}". `
+    + "Try another model in Settings.");
+
+  /** One request: { answers, cutOff, text }, or null when Groq refused it (bad or too large). */
+  async function ask(batch) {
     const user = batch.map((it, i) => `${i + 1}. ${line(it)}`).join("\n");
-    let answers;
     try {
-      answers = parseReplyLines(await groq.chatText(prompt, user, Math.min(4000, 40 + batch.length * outPerItem)));
+      const reply = await groq.chatText(prompt, user, Math.min(4000, 40 + batch.length * outPerItem));
+      return { ...reply, answers: parseReplyLines(reply.text) };
     } catch (err) {
-      if (err instanceof GroqError && (err.kind === "bad_output" || err.kind === "too_large") && batch.length > 1) {
-        const mid = Math.ceil(batch.length / 2);
-        await attempt(batch.slice(0, mid));
-        await attempt(batch.slice(mid));
-        return;
-      }
-      if (err instanceof GroqError && err.kind === "bad_output") { // a single item the model can't answer
-        onBatch({ [key(batch[0])]: { tags: [], mixed: false } });
-        return;
-      }
+      if (err instanceof GroqError && (err.kind === "bad_output" || err.kind === "too_large")) return null;
       throw err;
     }
+  }
+
+  function save(batch, answers) {
     const results = {};
     const missing = [];
     batch.forEach((it, i) => {
       const a = answers.get(String(i + 1));
       if (a) results[key(it)] = a;
-      else missing.push(it); // not answered (e.g. the reply was cut off): asked again below
+      else missing.push(it);
     });
-    if (missing.length === batch.length && batch.length > 1) { // ignored the whole batch: try smaller
-      const mid = Math.ceil(batch.length / 2);
-      await attempt(batch.slice(0, mid));
-      await attempt(batch.slice(mid));
-      return;
-    }
     onBatch(results);
-    if (missing.length && missing.length < batch.length) await attempt(missing);
-    else if (missing.length) for (const it of missing) onBatch({ [key(it)]: { tags: [], mixed: false } });
+    return missing;
   }
+
+  async function split(batch, retries) {
+    if (batch.length < 2) return; // a single item with no usable answer: left for next run
+    const mid = Math.ceil(batch.length / 2);
+    await attempt(batch.slice(0, mid), retries);
+    await attempt(batch.slice(mid), retries);
+  }
+
+  async function attempt(batch, retries = 2) {
+    const reply = await ask(batch);
+    if (!reply) return split(batch, retries);
+
+    if (!reply.answers.size) {
+      if (++streak >= 8) throw formatError(reply.text);
+      let rest = batch;
+      if (!readableSeen) {
+        // The format, or something in this batch? Ask about two items on their own.
+        for (const probe of [...new Set([batch[batch.length - 1], batch[0]])]) {
+          const single = await ask([probe]);
+          if (single?.answers.size) {
+            readableSeen = true;
+            save([probe], single.answers);
+            rest = batch.filter((it) => it !== probe);
+            break;
+          }
+        }
+        if (!readableSeen) throw formatError(reply.text);
+      }
+      return split(rest, retries);
+    }
+
+    readableSeen = true;
+    streak = 0;
+    const missing = save(batch, reply.answers);
+    if (missing.length && retries > 0) await attempt(missing, retries - 1);
+  }
+
   for (let i = 0; i < items.length; i += batchSize) await attempt(items.slice(i, i + batchSize));
 }
 
