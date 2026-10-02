@@ -116,7 +116,7 @@ test("a per-minute 429 is waited out; repeated ones stop cleanly", async () => {
 test("Groq's per-day 429 stops with a resume time, keeps progress, and blocks further sends", async () => {
   const { artists, list } = manyArtists(300);
   const s = setup({ groq: new FakeGroq({ artists }) });
-  s.groq.dailyLimit = 5000;
+  s.groq.dailyLimit = 2000;
   const cache = {};
   const err = await tagArtists(s.client, list, cache).catch((e) => e);
   assert.ok(err instanceof GroqDailyLimitError, String(err));
@@ -194,7 +194,7 @@ test("a full batch of realistic three-tag replies fits in the reply room", async
   const { client, groq } = setup({ groq: new FakeGroq({ artists }) });
   const cache = {};
   await tagArtists(client, list, cache);
-  assert.equal(groq.jsonFailures || 0, 0, "no reply was cut off");
+  assert.equal(groq.cutOffs || 0, 0, "no reply was cut off");
   assert.equal(Object.values(cache).filter((v) => v.tags.length === 3).length, 120);
 });
 
@@ -215,5 +215,35 @@ test("one artist the model always chokes on becomes unknown; the rest are sorted
   const cache = {};
   await tagArtists(s.client, list, cache);
   assert.deepEqual(cache.a17, { tags: [], mixed: false });
+  assert.ok(Object.keys(cache).length === 60);
   assert.equal(Object.values(cache).filter((v) => v.tags.length).length, 59);
+});
+
+test("a reply cut off at the length limit keeps its complete lines and asks only for the rest", async () => {
+  const artists = {};
+  const list = [];
+  for (let i = 0; i < 40; i++) {
+    // Long tags: each answer line is bigger than the room allowed per artist.
+    artists[`Band ${i}`] = { tags: ["progressive melodic metalcore revival", "atmospheric post-hardcore emo", "experimental mathcore ambient"] };
+    list.push({ id: `b${i}`, name: `Band ${i}`, titles: [], songCount: 1 });
+  }
+  const groq = new FakeGroq({ artists });
+  const s = setup({ groq });
+  const cache = {};
+  await tagArtists(s.client, list, cache, { batchSize: 40 });
+  assert.ok(groq.cutOffs > 0, "replies really were cut off");
+  assert.equal(Object.keys(cache).length, 40);
+  assert.ok(Object.values(cache).every((v) => v.tags.length === 3 && v.tags.every((t) => artists["Band 0"].tags.includes(t))),
+    "no half-written tags saved");
+});
+
+test("chatter around the answers is ignored", async () => {
+  const { artists, list } = manyArtists(20);
+  const groq = new FakeGroq({ artists });
+  groq.preamble = "Sure! Here are the Spotify-style genres:\n\n";
+  const s = setup({ groq });
+  const cache = {};
+  await tagArtists(s.client, list, cache);
+  assert.equal(Object.values(cache).filter((v) => v.tags.length).length, 20);
+  assert.equal(groq.requests, 1);
 });
