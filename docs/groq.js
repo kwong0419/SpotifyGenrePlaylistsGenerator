@@ -11,8 +11,10 @@
 //     so the daily budget holds across page reloads and tabs.
 //   * a 429 for the minute is waited out (at most 3 in a row); a 429 for the day, or our
 //     own daily budget running out, stops with GroqDailyLimitError and a resume time.
-//   * bad or oversized replies are retried in smaller batches; artists the model doesn't
-//     know are recorded as unknown rather than guessed.
+//   * replies are one short line per item rather than JSON: about half the tokens, and a
+//     reply cut off at the length limit still yields every complete line (only the
+//     missing items are asked again). Unusable or oversized replies are retried in
+//     smaller batches; items the model doesn't know are recorded as unknown, not guessed.
 
 const API = "https://api.groq.com/openai/v1";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -186,14 +188,18 @@ export function createGroq({
       const data = await call("/models");
       return (data?.data || []).map((m) => m.id);
     },
-    /** One JSON-mode chat completion, budgeted before sending and recorded after. */
-    async chatJSON(system, user, maxTokens) {
+    /**
+     * One plain-text chat completion, budgeted before sending and recorded after.
+     * Plain text on purpose: in JSON mode Groq refuses a whole reply (and still charges
+     * for it) if it's cut off or malformed, whereas a cut-off text reply is still usable.
+     */
+    async chatText(system, user, maxTokens) {
       const estimated = estimateTokens(system + user) + maxTokens;
       await waitForBudget(estimated);
       let data;
       try {
         data = await call("/chat/completions", {
-          model, temperature: 0, max_tokens: maxTokens, response_format: { type: "json_object" },
+          model, temperature: 0, max_tokens: maxTokens,
           messages: [{ role: "system", content: system }, { role: "user", content: user }],
         });
       } catch (err) {
@@ -201,14 +207,12 @@ export function createGroq({
         throw err;
       }
       record(data?.usage?.total_tokens ?? estimated);
-      if (data?.choices?.[0]?.finish_reason === "length") {
-        throw new GroqError("bad_output", "The model's reply was cut off at the length limit");
-      }
-      try {
-        return JSON.parse(data.choices[0].message.content);
-      } catch {
-        throw new GroqError("bad_output", "Groq's reply wasn't valid JSON");
-      }
+      let text = data?.choices?.[0]?.message?.content;
+      if (typeof text !== "string") throw new GroqError("bad_output", "Groq's reply had no text");
+      // Cut off at the length limit: the last line may be half-written, so drop it and let
+      // that item be asked again rather than saving a truncated tag.
+      if (data.choices[0].finish_reason === "length") text = text.slice(0, Math.max(0, text.lastIndexOf("\n")));
+      return text;
     },
     /** For progress messages: rough tokens/minute we allow ourselves, and what's left today. */
     budget() {
@@ -229,29 +233,37 @@ export function chooseModel(available) {
 
 const ARTIST_PROMPT = `You tag music artists with genres the way Spotify does on artist pages.
 For each numbered artist (with example songs from the listener's library), give 1-3 Spotify-style genre tags, most representative first, lowercase, e.g. "chicago drill", "bedroom pop", "classic oklahoma country", "k-pop girl group", "reggaeton", "uk garage", "art pop".
-If you don't confidently recognise the artist, give an empty list. Never guess from the name alone.
-Also give the numbers of artists whose songs clearly span different broad genres (e.g. both hip hop and rock, or both country and pop).
-Reply with JSON only, in this shape: {"tags":{"1":["tag","tag"],"2":[]},"mixed":[3]}`;
+If you don't confidently recognise the artist, leave the answer empty. Never guess from the name alone.
+Add "| mixed" when the artist's songs clearly span different broad genres (e.g. both hip hop and rock, or both country and pop).
+Reply with exactly one line per artist, in order, and nothing else:
+1: chicago drill, drill
+2:
+3: country pop, pop | mixed`;
 
 const SONG_PROMPT = `You tag individual songs with genres the way Spotify would.
 For each numbered song, give 1-2 Spotify-style genre tags describing that specific song (not the artist in general), lowercase, e.g. "pop rap", "alternative rock", "contemporary country", "dance pop".
-If you don't confidently know the song, give an empty list. Never guess.
-Reply with JSON only, in this shape: {"tags":{"1":["tag"],"2":[]}}`;
+If you don't confidently know the song, leave the answer empty. Never guess.
+Reply with exactly one line per song, in order, and nothing else:
+1: pop rap
+2:
+3: alternative rock, pop rock`;
 
 /**
  * Roughly how long tagging these artists will take and how much of the daily allowance
  * it needs: { tokens, minutes, days } where days > 1 means it continues on later days.
  */
-// Reply room per item: a few tags like "conscious hip hop" plus JSON punctuation. Too
-// little and the model is cut off mid-reply, which Groq then refuses as invalid JSON.
-const ARTIST_REPLY_TOKENS = 28;
-const SONG_REPLY_TOKENS = 20;
+// A reply line like "12: conscious hip hop, west coast rap, hip hop" is ~14 tokens. The
+// room allowed per item is generous so replies are rarely cut off (and a cut-off reply
+// still yields its complete lines); the estimate uses the typical size.
+const ARTIST_REPLY_ROOM = 24;
+const ARTIST_REPLY_TYPICAL = 14;
+const SONG_REPLY_ROOM = 16;
 const ARTIST_BATCH = 60;
 const SONG_BATCH = 50;
 
 export function estimateArtistJob(groq, artists, batchSize = ARTIST_BATCH) {
   const perBatch = estimateTokens(ARTIST_PROMPT) + 40;
-  const tokens = artists.reduce((n, a) => n + estimateTokens(artistLine(a)) + 3 + ARTIST_REPLY_TOKENS, 0)
+  const tokens = artists.reduce((n, a) => n + estimateTokens(artistLine(a)) + 3 + ARTIST_REPLY_TYPICAL, 0)
     + Math.ceil(artists.length / batchSize) * perBatch;
   const { tpm, tpd, dayLeft } = groq.budget();
   const today = Math.min(tokens, dayLeft);
@@ -262,10 +274,29 @@ export function estimateArtistJob(groq, artists, batchSize = ARTIST_BATCH) {
 }
 
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
-const cleanTags = (v) => (Array.isArray(v) ? v : [])
-  .filter((t) => typeof t === "string" && t.trim())
-  .map((t) => t.trim().toLowerCase().slice(0, 40))
-  .slice(0, 3);
+const NOT_A_TAG = /^(unknown|none|n\/a|na|-+|\?+|empty)$/i;
+
+/**
+ * Reads "N: tag, tag | mixed" lines into Map(N -> { tags, mixed }). Tolerant of the small
+ * ways models drift from the format ("1." or "1)", quotes, brackets, the name echoed back
+ * as "1: Name: tags"). Lines it can't read are simply missing, so they get asked again.
+ */
+export function parseReplyLines(text) {
+  const out = new Map();
+  for (const raw of text.split(/\r?\n/)) {
+    const m = /^\s*[*-]?\s*(\d+)\s*[:.)\]–-]\s*(.*)$/.exec(raw);
+    if (!m) continue;
+    let [answer, flags = ""] = m[2].split("|");
+    if (answer.includes(":")) answer = answer.slice(answer.lastIndexOf(":") + 1); // "Name: tags"
+    const tags = answer.split(/[,;]/)
+      .map((t) => t.replace(/["'`*[\]{}()]/g, "").trim().toLowerCase())
+      .filter((t) => t && !NOT_A_TAG.test(t))
+      .map((t) => t.slice(0, 40))
+      .slice(0, 3);
+    if (!out.has(m[1])) out.set(m[1], { tags, mixed: /mixed/i.test(flags) });
+  }
+  return out;
+}
 
 /**
  * Runs `items` through the model in batches, splitting a batch in half when the reply is
@@ -275,9 +306,9 @@ const cleanTags = (v) => (Array.isArray(v) ? v : [])
 async function runBatches(groq, items, { prompt, line, key, batchSize, outPerItem, onBatch }) {
   async function attempt(batch) {
     const user = batch.map((it, i) => `${i + 1}. ${line(it)}`).join("\n");
-    let reply;
+    let answers;
     try {
-      reply = await groq.chatJSON(prompt, user, Math.min(4000, 40 + batch.length * outPerItem));
+      answers = parseReplyLines(await groq.chatText(prompt, user, Math.min(4000, 40 + batch.length * outPerItem)));
     } catch (err) {
       if (err instanceof GroqError && (err.kind === "bad_output" || err.kind === "too_large") && batch.length > 1) {
         const mid = Math.ceil(batch.length / 2);
@@ -291,14 +322,12 @@ async function runBatches(groq, items, { prompt, line, key, batchSize, outPerIte
       }
       throw err;
     }
-    const tags = reply?.tags && typeof reply.tags === "object" ? reply.tags : {};
-    const mixed = new Set((Array.isArray(reply?.mixed) ? reply.mixed : []).map(String));
     const results = {};
     const missing = [];
     batch.forEach((it, i) => {
-      const n = String(i + 1);
-      if (n in tags) results[key(it)] = { tags: cleanTags(tags[n]), mixed: mixed.has(n) };
-      else missing.push(it);
+      const a = answers.get(String(i + 1));
+      if (a) results[key(it)] = a;
+      else missing.push(it); // not answered (e.g. the reply was cut off): asked again below
     });
     if (missing.length === batch.length && batch.length > 1) { // ignored the whole batch: try smaller
       const mid = Math.ceil(batch.length / 2);
@@ -325,7 +354,7 @@ export async function tagArtists(groq, artists, cache, { batchSize = ARTIST_BATC
   let done = 0;
   onProgress(0, todo.length);
   await runBatches(groq, todo, {
-    prompt: ARTIST_PROMPT, batchSize, outPerItem: ARTIST_REPLY_TOKENS, key: (a) => a.id,
+    prompt: ARTIST_PROMPT, batchSize, outPerItem: ARTIST_REPLY_ROOM, key: (a) => a.id,
     line: artistLine,
     onBatch: (results) => {
       Object.assign(cache, results);
@@ -343,7 +372,7 @@ export async function tagSongs(groq, songs, cache, { batchSize = SONG_BATCH, onP
   let done = 0;
   onProgress(0, todo.length);
   await runBatches(groq, todo, {
-    prompt: SONG_PROMPT, batchSize, outPerItem: SONG_REPLY_TOKENS, key: (s) => s.uri,
+    prompt: SONG_PROMPT, batchSize, outPerItem: SONG_REPLY_ROOM, key: (s) => s.uri,
     line: (s) => `"${clip(s.title, 60)}" by ${clip(s.artist, 40)}`,
     onBatch: (results) => {
       for (const [k, v] of Object.entries(results)) cache[k] = { tags: v.tags };

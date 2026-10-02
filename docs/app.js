@@ -374,7 +374,7 @@ async function scanLibrary() {
       .map((t) => ({ uri: t.uri, title: t.name, artist: t.artistNames[0] }));
     const songsLeft = songs.filter((x) => !(x.uri in songTags)).length;
     const songLine = liveProgress("Sorting songs by artists who mix genres…", "songs",
-      ((songsLeft * 32) / groq.budget().tpm) * 60000 * 1.15, STEPS.sort);
+      ((songsLeft * 18) / groq.budget().tpm) * 60000 * 1.15, STEPS.sort);
     try {
       await tagSongs(groq, songs, songTags, {
         onProgress: (done, total) => songLine.update(done, total),

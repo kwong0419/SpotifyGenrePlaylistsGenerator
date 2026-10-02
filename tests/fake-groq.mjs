@@ -12,10 +12,11 @@ export class FakeGroq {
     this.requests = 0;
     this.dailyLimit = Infinity;  // tokens; going past it gives a per-day 429
     this.minuteLimitNext = 0;    // next N completions get a per-minute 429
-    this.garbleNext = 0;         // next N completions reply with broken JSON
+    this.garbleNext = 0;         // next N completions reply with prose instead of answers
+    this.preamble = "";          // text the model adds before its answers
     this.dropEvery = 0;          // leave out every Nth item from replies
     this.jsonFailNext = 0;       // next N completions: Groq's 400 json_validate_failed
-    this.poison = null;          // any batch containing this name always fails JSON validation
+    this.poison = null;          // any batch containing this name gets an unusable reply
     this.calls = [];             // number of items in each completion request
   }
   reply(status, body) {
@@ -42,34 +43,38 @@ export class FakeGroq {
     this.requests++;
     const lines = req.messages[1].content.split("\n");
     this.calls.push(lines.length);
-    const tags = {};
-    const mixed = [];
-    lines.forEach((line, i) => {
-      const n = String(i + 1);
-      if (this.dropEvery && (i + 1) % this.dropEvery === 0) return;
-      const song = /^\d+\. "(.*)" by (.*)$/.exec(line);
-      if (song) { tags[n] = this.songs[song[1]] || []; return; }
-      const name = /^\d+\. (.*?)(?: \(songs: .*\))?$/.exec(line)[1];
-      const known = this.artists[name];
-      tags[n] = known?.tags || [];
-      if (known?.mixed) mixed.push(+n);
-    });
-    const content = this.garbleNext-- > 0 ? '{"tags": {"1": ["hip' : JSON.stringify({ tags, mixed });
-    const completionTokens = Math.ceil(content.length / 3.5);
-    // Like real Groq in JSON mode: a reply that doesn't fit max_tokens is cut off, fails
-    // validation and is refused, as is any reply that isn't valid JSON.
     const poisoned = this.poison && lines.some((l) => l.includes(this.poison));
-    if (completionTokens > req.max_tokens || poisoned || this.jsonFailNext-- > 0) {
-      this.tokensUsed += promptTokens + Math.min(completionTokens, req.max_tokens);
+    if (this.jsonFailNext-- > 0) { // Groq's JSON-mode refusal, kept to prove it's still handled
+      this.tokensUsed += promptTokens;
       this.jsonFailures = (this.jsonFailures || 0) + 1;
       return this.reply(400, { error: {
         message: "Failed to validate JSON. Please adjust your prompt. See 'failed_generation' for more details.",
-        type: "invalid_request_error", code: "json_validate_failed", failed_generation: content.slice(0, 50),
+        type: "invalid_request_error", code: "json_validate_failed",
       } });
     }
+    const answers = [];
+    lines.forEach((line, i) => {
+      const n = i + 1;
+      if (this.dropEvery && n % this.dropEvery === 0) return;
+      const song = /^\d+\. "(.*)" by (.*)$/.exec(line);
+      if (song) { answers.push(`${n}: ${(this.songs[song[1]] || []).join(", ")}`); return; }
+      const name = /^\d+\. (.*?)(?: \(songs: .*\))?$/.exec(line)[1];
+      const known = this.artists[name];
+      answers.push(`${n}: ${(known?.tags || []).join(", ")}${known?.mixed ? " | mixed" : ""}`);
+    });
+    let content = (this.preamble || "") + answers.join("\n");
+    if (this.garbleNext-- > 0 || poisoned) content = "I'm sorry, I can't help with that list.";
+    // Like real Groq: a reply longer than max_tokens is cut off mid-line.
+    let finish = "stop";
+    if (Math.ceil(content.length / 3.5) > req.max_tokens) {
+      content = content.slice(0, Math.floor(req.max_tokens * 3.5));
+      finish = "length";
+      this.cutOffs = (this.cutOffs || 0) + 1;
+    }
+    const completionTokens = Math.ceil(content.length / 3.5);
     this.tokensUsed += promptTokens + completionTokens;
     return this.reply(200, {
-      choices: [{ message: { content } }],
+      choices: [{ message: { content }, finish_reason: finish }],
       usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
     });
   };
