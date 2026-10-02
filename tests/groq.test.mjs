@@ -183,3 +183,37 @@ test("a bad key or missing model is reported clearly", async () => {
   assert.equal(chooseModel(["whisper-large-v3", "llama-3.1-8b-instant"]), "llama-3.1-8b-instant");
   assert.equal(chooseModel(["whisper-large-v3", "some-new-model"]), "some-new-model");
 });
+
+test("a full batch of realistic three-tag replies fits in the reply room", async () => {
+  const artists = {};
+  const list = [];
+  for (let i = 0; i < 120; i++) {
+    artists[`Artist Number ${i}`] = { tags: ["conscious hip hop", "west coast rap", "alternative r&b"], mixed: i % 7 === 0 };
+    list.push({ id: `a${i}`, name: `Artist Number ${i}`, titles: ["A Fairly Long Song Title Here", "Another One"], songCount: 1 });
+  }
+  const { client, groq } = setup({ groq: new FakeGroq({ artists }) });
+  const cache = {};
+  await tagArtists(client, list, cache);
+  assert.equal(groq.jsonFailures || 0, 0, "no reply was cut off");
+  assert.equal(Object.values(cache).filter((v) => v.tags.length === 3).length, 120);
+});
+
+test("Groq refusing a reply as invalid JSON is retried smaller, never fatal", async () => {
+  const { artists, list } = manyArtists(60);
+  const s = setup({ groq: new FakeGroq({ artists }) });
+  s.groq.jsonFailNext = 2;
+  const cache = {};
+  await tagArtists(s.client, list, cache);
+  assert.equal(Object.keys(cache).length, 60);
+  assert.ok(Object.values(cache).every((v) => v.tags.length), "everything recovered");
+});
+
+test("one artist the model always chokes on becomes unknown; the rest are sorted", async () => {
+  const { artists, list } = manyArtists(60);
+  const s = setup({ groq: new FakeGroq({ artists }) });
+  s.groq.poison = "Artist 17";
+  const cache = {};
+  await tagArtists(s.client, list, cache);
+  assert.deepEqual(cache.a17, { tags: [], mixed: false });
+  assert.equal(Object.values(cache).filter((v) => v.tags.length).length, 59);
+});

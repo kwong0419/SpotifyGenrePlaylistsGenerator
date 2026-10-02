@@ -14,6 +14,8 @@ export class FakeGroq {
     this.minuteLimitNext = 0;    // next N completions get a per-minute 429
     this.garbleNext = 0;         // next N completions reply with broken JSON
     this.dropEvery = 0;          // leave out every Nth item from replies
+    this.jsonFailNext = 0;       // next N completions: Groq's 400 json_validate_failed
+    this.poison = null;          // any batch containing this name always fails JSON validation
     this.calls = [];             // number of items in each completion request
   }
   reply(status, body) {
@@ -54,6 +56,17 @@ export class FakeGroq {
     });
     const content = this.garbleNext-- > 0 ? '{"tags": {"1": ["hip' : JSON.stringify({ tags, mixed });
     const completionTokens = Math.ceil(content.length / 3.5);
+    // Like real Groq in JSON mode: a reply that doesn't fit max_tokens is cut off, fails
+    // validation and is refused, as is any reply that isn't valid JSON.
+    const poisoned = this.poison && lines.some((l) => l.includes(this.poison));
+    if (completionTokens > req.max_tokens || poisoned || this.jsonFailNext-- > 0) {
+      this.tokensUsed += promptTokens + Math.min(completionTokens, req.max_tokens);
+      this.jsonFailures = (this.jsonFailures || 0) + 1;
+      return this.reply(400, { error: {
+        message: "Failed to validate JSON. Please adjust your prompt. See 'failed_generation' for more details.",
+        type: "invalid_request_error", code: "json_validate_failed", failed_generation: content.slice(0, 50),
+      } });
+    }
     this.tokensUsed += promptTokens + completionTokens;
     return this.reply(200, {
       choices: [{ message: { content } }],

@@ -152,6 +152,11 @@ export function createGroq({
       if (resp.status === 404 || /model.*(not found|decommissioned|does not exist)/i.test(message)) {
         throw new GroqError("model", `Groq doesn't offer the model "${body?.model}" to this key any more. Pick another in Settings.`);
       }
+      // In JSON mode Groq checks the model's reply itself and refuses invalid JSON (often a
+      // reply cut short). That's a bad reply like any other: the batch is retried smaller.
+      if (resp.status === 400 && (data?.error?.code === "json_validate_failed" || /validate JSON|failed_generation/i.test(message))) {
+        throw new GroqError("bad_output", "The model's reply wasn't valid JSON");
+      }
       if (resp.status === 413 || /context|too large|maximum.*tokens/i.test(message)) {
         throw new GroqError("too_large", message || "Request too large");
       }
@@ -196,6 +201,9 @@ export function createGroq({
         throw err;
       }
       record(data?.usage?.total_tokens ?? estimated);
+      if (data?.choices?.[0]?.finish_reason === "length") {
+        throw new GroqError("bad_output", "The model's reply was cut off at the length limit");
+      }
       try {
         return JSON.parse(data.choices[0].message.content);
       } catch {
@@ -234,9 +242,16 @@ Reply with JSON only, in this shape: {"tags":{"1":["tag"],"2":[]}}`;
  * Roughly how long tagging these artists will take and how much of the daily allowance
  * it needs: { tokens, minutes, days } where days > 1 means it continues on later days.
  */
-export function estimateArtistJob(groq, artists, batchSize = 80) {
+// Reply room per item: a few tags like "conscious hip hop" plus JSON punctuation. Too
+// little and the model is cut off mid-reply, which Groq then refuses as invalid JSON.
+const ARTIST_REPLY_TOKENS = 28;
+const SONG_REPLY_TOKENS = 20;
+const ARTIST_BATCH = 60;
+const SONG_BATCH = 50;
+
+export function estimateArtistJob(groq, artists, batchSize = ARTIST_BATCH) {
   const perBatch = estimateTokens(ARTIST_PROMPT) + 40;
-  const tokens = artists.reduce((n, a) => n + estimateTokens(artistLine(a)) + 3 + 16, 0)
+  const tokens = artists.reduce((n, a) => n + estimateTokens(artistLine(a)) + 3 + ARTIST_REPLY_TOKENS, 0)
     + Math.ceil(artists.length / batchSize) * perBatch;
   const { tpm, tpd, dayLeft } = groq.budget();
   const today = Math.min(tokens, dayLeft);
@@ -305,12 +320,12 @@ const artistLine = (a) => `${clip(a.name, 60)}${a.titles.length ? ` (songs: ${a.
  * `artists` is [{ id, name, titles, songCount }]; artists with the most liked songs go
  * first, so if the daily allowance runs out, the most music is already sorted.
  */
-export async function tagArtists(groq, artists, cache, { batchSize = 80, onProgress = () => {}, onSaved = () => {} } = {}) {
+export async function tagArtists(groq, artists, cache, { batchSize = ARTIST_BATCH, onProgress = () => {}, onSaved = () => {} } = {}) {
   const todo = artists.filter((a) => !(a.id in cache)).sort((a, b) => b.songCount - a.songCount);
   let done = 0;
   onProgress(0, todo.length);
   await runBatches(groq, todo, {
-    prompt: ARTIST_PROMPT, batchSize, outPerItem: 16, key: (a) => a.id,
+    prompt: ARTIST_PROMPT, batchSize, outPerItem: ARTIST_REPLY_TOKENS, key: (a) => a.id,
     line: artistLine,
     onBatch: (results) => {
       Object.assign(cache, results);
@@ -323,12 +338,12 @@ export async function tagArtists(groq, artists, cache, { batchSize = 80, onProgr
 }
 
 /** Tags songs not yet in `cache` (song uri -> { tags }), mutating it. `songs` is [{ uri, title, artist }]. */
-export async function tagSongs(groq, songs, cache, { batchSize = 60, onProgress = () => {}, onSaved = () => {} } = {}) {
+export async function tagSongs(groq, songs, cache, { batchSize = SONG_BATCH, onProgress = () => {}, onSaved = () => {} } = {}) {
   const todo = songs.filter((s) => !(s.uri in cache));
   let done = 0;
   onProgress(0, todo.length);
   await runBatches(groq, todo, {
-    prompt: SONG_PROMPT, batchSize, outPerItem: 12, key: (s) => s.uri,
+    prompt: SONG_PROMPT, batchSize, outPerItem: SONG_REPLY_TOKENS, key: (s) => s.uri,
     line: (s) => `"${clip(s.title, 60)}" by ${clip(s.artist, 40)}`,
     onBatch: (results) => {
       for (const [k, v] of Object.entries(results)) cache[k] = { tags: v.tags };
