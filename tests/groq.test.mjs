@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
-  parseReplyLines, createGroq, chooseModel, tagArtists, tagSongs, GroqError, GroqDailyLimitError, MODEL_LIMITS,
+  parseReplyLines, createGroq, chooseModel, clearUsageEstimates, tagArtists, tagSongs, GroqError, GroqDailyLimitError, MODEL_LIMITS,
 } from "../docs/groq.js";
 import { groupTracks } from "../docs/core.js";
 import { FakeGroq } from "./fake-groq.mjs";
@@ -310,4 +310,29 @@ test("the key's real model list picks gpt-oss-120b, and never a speech or safety
     "canopylabs/orpheus-v1-english", "meta-llama/llama-prompt-guard-2-22m", "openai/gpt-oss-20b"];
   assert.equal(chooseModel(live), "openai/gpt-oss-120b");
   assert.equal(chooseModel(live.filter((m) => !m.includes("gpt-oss-120b") && !m.includes("gpt-oss-20b"))), "qwen/qwen3.8-27b");
+});
+
+test("the app's own daily count is labelled as an estimate, and 'check with Groq' asks Groq directly", async () => {
+  const { artists, list } = manyArtists(30);
+  const s = setup({ groq: new FakeGroq({ artists }), ledgerEntries: [{ t: Date.UTC(2026, 9, 1, 2), tokens: 89_900 }] });
+  const err = await tagArtists(s.client, list, {}).catch((e) => e);
+  assert.ok(err instanceof GroqDailyLimitError);
+  assert.equal(err.source, "estimate");
+  assert.equal(s.groq.requests, 0);
+  clearUsageEstimates(s.ledger);
+  const cache = {};
+  await tagArtists(s.client, list, cache);
+  assert.equal(Object.keys(cache).length, 30, "Groq still had allowance, so sorting went ahead");
+});
+
+test("a limit Groq itself gave is kept when our estimate is cleared", async () => {
+  const { artists, list } = manyArtists(30);
+  const s = setup({ groq: new FakeGroq({ artists }) });
+  s.groq.dailyLimit = 100;
+  const err = await tagArtists(s.client, list, {}).catch((e) => e);
+  assert.equal(err.source, "groq");
+  clearUsageEstimates(s.ledger);
+  const again = await tagArtists(s.client, list, {}).catch((e) => e);
+  assert.ok(again instanceof GroqDailyLimitError && again.source === "groq");
+  assert.equal(s.groq.requests, 0, "nothing sent while Groq's own block lasts");
 });
