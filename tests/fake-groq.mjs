@@ -1,5 +1,8 @@
 // An in-memory Groq that knows a fixed set of artists and songs, counts tokens, and can
-// misbehave on purpose: per-minute and per-day 429s, garbled or partial replies, bad keys.
+// misbehave on purpose: per-minute and per-day 429s, garbled or partial replies, answers
+// without numbers, skipped answers, strict mode turned down, bad keys.
+// Like the real API, a request with a strict json_schema response_format gets a JSON reply
+// in exactly that shape; otherwise the model answers in lines.
 // Used by the Node tests and by tests/demo.html.
 
 export class FakeGroq {
@@ -17,6 +20,10 @@ export class FakeGroq {
     this.dropEvery = 0;          // leave out every Nth item from replies
     this.jsonFailNext = 0;       // next N completions: Groq's 400 json_validate_failed
     this.poison = null;          // any batch containing this name gets an unusable reply
+    this.unnumbered = false;     // line replies leave out the "N:" numbers
+    this.omitBlank = false;      // line replies skip the lines for unknown items
+    this.noSchema = false;       // turn down strict structured output (400)
+    this.structuredRequests = 0;
     this.calls = [];             // number of items in each completion request
   }
   reply(status, body) {
@@ -52,19 +59,40 @@ export class FakeGroq {
         type: "invalid_request_error", code: "json_validate_failed",
       } });
     }
+    const structured = req.response_format?.type === "json_schema";
+    if (structured && this.noSchema) {
+      this.tokensUsed += promptTokens;
+      return this.reply(400, { error: {
+        message: "response_format `json_schema` is not supported with this model", type: "invalid_request_error",
+      } });
+    }
+    if (structured) this.structuredRequests++;
+
     const answers = [];
     lines.forEach((line, i) => {
       const n = i + 1;
       if (this.dropEvery && n % this.dropEvery === 0) return;
       if (this.skip && [...this.skip].some((name) => line.includes(`${name} (`) || line.endsWith(name))) return;
       const song = /^\d+\. "(.*)" by (.*)$/.exec(line);
-      if (song) { answers.push(`${n}: ${(this.songs[song[1]] || []).join(", ")}`); return; }
+      if (song) { answers.push({ n, tags: this.songs[song[1]] || [], song: true }); return; }
       const name = /^\d+\. (.*?)(?: \(songs: .*\))?$/.exec(line)[1];
       const known = this.artists[name];
-      answers.push(`${n}: ${(known?.tags || []).join(", ")}${known?.mixed ? " | mixed" : ""}`);
+      answers.push({ n, tags: known?.tags || [], mixed: !!known?.mixed });
     });
-    let content = (this.preamble || "") + answers.join("\n");
-    if (this.garbleNext-- > 0 || poisoned) content = "I'm sorry, I can't help with that list.";
+
+    let content;
+    if (structured) {
+      // Constrained decoding: always this exact shape, whatever else is going on.
+      const results = poisoned || this.garbleNext-- > 0 ? []
+        : answers.map((a) => (a.song ? { n: a.n, tags: a.tags } : { n: a.n, tags: a.tags, mixed: a.mixed }));
+      content = JSON.stringify({ results });
+    } else {
+      content = (this.preamble || "") + answers
+        .filter((a) => !(this.omitBlank && !a.tags.length))
+        .map((a) => `${this.unnumbered ? "" : `${a.n}: `}${a.tags.join(", ")}${a.mixed ? " | mixed" : ""}`)
+        .join("\n");
+      if (this.garbleNext-- > 0 || poisoned) content = "I'm sorry, I can't help with that list.";
+    }
     // Like gpt-oss on Groq: reasoning models think first, and the thinking uses up
     // max_tokens before any answer is written (less with reasoning_effort "low").
     const thinking = /gpt-oss/.test(req.model) ? (req.reasoning_effort === "low" ? 200 : 900) : 0;
