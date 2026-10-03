@@ -49,6 +49,14 @@ export class GroqDailyLimitError extends Error {
 
 export const estimateTokens = (text) => Math.ceil(text.length / 3.5);
 
+/**
+ * Reasoning models (gpt-oss, qwen3, deepseek-r1...) think before answering, and that
+ * thinking counts against max_tokens: with room for only the answer, they spend it all
+ * thinking and reply with nothing. So they're asked to think briefly, and get extra room.
+ */
+export const isReasoningModel = (model) => /gpt-oss|qwen3|qwq|deepseek-r1|reason/i.test(model || "");
+export const REASONING_ROOM = 1024;
+
 /** "Please try again in 1h2m3.5s" -> ms */
 function parseTryAgain(message) {
   const m = /try again in\s+(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?(?:([\d.]+)ms)?/i.exec(message || "");
@@ -194,12 +202,15 @@ export function createGroq({
      * for it) if it's cut off or malformed, whereas a cut-off text reply is still usable.
      */
     async chatText(system, user, maxTokens) {
+      const reasoning = isReasoningModel(model);
+      if (reasoning) maxTokens += REASONING_ROOM;
       const estimated = estimateTokens(system + user) + maxTokens;
       await waitForBudget(estimated);
       let data;
       try {
         data = await call("/chat/completions", {
           model, temperature: 0, max_tokens: maxTokens,
+          ...(reasoning ? { reasoning_effort: "low", include_reasoning: false } : {}),
           messages: [{ role: "system", content: system }, { role: "user", content: user }],
         });
       } catch (err) {
@@ -211,8 +222,9 @@ export function createGroq({
       if (typeof text !== "string") throw new GroqError("bad_output", "Groq's reply had no text");
       // Cut off at the length limit: the last line may be half-written, so drop it and let
       // that item be asked again rather than saving a truncated tag.
-      if (data.choices[0].finish_reason === "length") text = text.slice(0, Math.max(0, text.lastIndexOf("\n")));
-      return text;
+      const cutOff = data.choices[0].finish_reason === "length";
+      if (cutOff) text = text.slice(0, Math.max(0, text.lastIndexOf("\n")));
+      return { text, cutOff };
     },
     /** For progress messages: rough tokens/minute we allow ourselves, and what's left today. */
     budget() {
@@ -225,7 +237,7 @@ export function createGroq({
 /** The first model in our preference list that this key can use (or any chat model). */
 export function chooseModel(available) {
   return PREFERRED_MODELS.find((m) => available.includes(m))
-    || available.find((m) => !/whisper|tts|guard|embed|vision/i.test(m))
+    || available.find((m) => !/whisper|tts|guard|embed|vision|orpheus|allam/i.test(m))
     || null;
 }
 
@@ -262,7 +274,8 @@ const ARTIST_BATCH = 60;
 const SONG_BATCH = 50;
 
 export function estimateArtistJob(groq, artists, batchSize = ARTIST_BATCH) {
-  const perBatch = estimateTokens(ARTIST_PROMPT) + 40;
+  // Reasoning models also think a little per request (asked for low effort: ~a few hundred tokens).
+  const perBatch = estimateTokens(ARTIST_PROMPT) + 40 + (isReasoningModel(groq.model) ? 300 : 0);
   const tokens = artists.reduce((n, a) => n + estimateTokens(artistLine(a)) + 3 + ARTIST_REPLY_TYPICAL, 0)
     + Math.ceil(artists.length / batchSize) * perBatch;
   const { tpm, tpd, dayLeft } = groq.budget();
@@ -299,46 +312,88 @@ export function parseReplyLines(text) {
 }
 
 /**
- * Runs `items` through the model in batches, splitting a batch in half when the reply is
- * unusable or too large, down to single items. Items still unanswered are reported as
- * unknown (empty tags). `onBatch(results)` gets { key: { tags, mixed } } after each batch.
+ * Runs `items` through the model in batches. `onBatch(results)` gets { key: { tags, mixed } }
+ * for every item the model actually answered; a blank answer means "unknown".
+ *
+ * Items the model didn't answer are never saved: they're asked again (up to twice) and
+ * otherwise left for the next run, so a reply the app couldn't read can't turn into a
+ * permanent "unknown". A batch is split in half when Groq refuses it or its reply can't be
+ * read (retrying it unchanged is pointless: with temperature 0 the model says the same
+ * again), which narrows a problem down to the item causing it.
+ *
+ * To avoid burning the allowance on a reply format the app can't read: until a readable
+ * reply has been seen, an unreadable one is followed by two single-item questions. If
+ * neither is readable either, it's the format, not the batch, and sorting stops with a
+ * snippet of the reply. It also stops after 8 unreadable replies in a row.
  */
 async function runBatches(groq, items, { prompt, line, key, batchSize, outPerItem, onBatch }) {
-  async function attempt(batch) {
+  let readableSeen = false;
+  let streak = 0;
+
+  const formatError = (text) => new GroqError("format", "Sorting stopped to save your Groq allowance: the model's "
+    + `replies aren't in the expected format. It replied: "${text.trim().replace(/\s+/g, " ").slice(0, 160) || "(nothing)"}". `
+    + "Try another model in Settings.");
+
+  /** One request: { answers, cutOff, text }, or null when Groq refused it (bad or too large). */
+  async function ask(batch) {
     const user = batch.map((it, i) => `${i + 1}. ${line(it)}`).join("\n");
-    let answers;
     try {
-      answers = parseReplyLines(await groq.chatText(prompt, user, Math.min(4000, 40 + batch.length * outPerItem)));
+      const reply = await groq.chatText(prompt, user, Math.min(4000, 40 + batch.length * outPerItem));
+      return { ...reply, answers: parseReplyLines(reply.text) };
     } catch (err) {
-      if (err instanceof GroqError && (err.kind === "bad_output" || err.kind === "too_large") && batch.length > 1) {
-        const mid = Math.ceil(batch.length / 2);
-        await attempt(batch.slice(0, mid));
-        await attempt(batch.slice(mid));
-        return;
-      }
-      if (err instanceof GroqError && err.kind === "bad_output") { // a single item the model can't answer
-        onBatch({ [key(batch[0])]: { tags: [], mixed: false } });
-        return;
-      }
+      if (err instanceof GroqError && (err.kind === "bad_output" || err.kind === "too_large")) return null;
       throw err;
     }
+  }
+
+  function save(batch, answers) {
     const results = {};
     const missing = [];
     batch.forEach((it, i) => {
       const a = answers.get(String(i + 1));
       if (a) results[key(it)] = a;
-      else missing.push(it); // not answered (e.g. the reply was cut off): asked again below
+      else missing.push(it);
     });
-    if (missing.length === batch.length && batch.length > 1) { // ignored the whole batch: try smaller
-      const mid = Math.ceil(batch.length / 2);
-      await attempt(batch.slice(0, mid));
-      await attempt(batch.slice(mid));
-      return;
-    }
     onBatch(results);
-    if (missing.length && missing.length < batch.length) await attempt(missing);
-    else if (missing.length) for (const it of missing) onBatch({ [key(it)]: { tags: [], mixed: false } });
+    return missing;
   }
+
+  async function split(batch, retries) {
+    if (batch.length < 2) return; // a single item with no usable answer: left for next run
+    const mid = Math.ceil(batch.length / 2);
+    await attempt(batch.slice(0, mid), retries);
+    await attempt(batch.slice(mid), retries);
+  }
+
+  async function attempt(batch, retries = 2) {
+    const reply = await ask(batch);
+    if (!reply) return split(batch, retries);
+
+    if (!reply.answers.size) {
+      if (++streak >= 8) throw formatError(reply.text);
+      let rest = batch;
+      if (!readableSeen) {
+        // The format, or something in this batch? Ask about two items on their own.
+        for (const probe of [...new Set([batch[batch.length - 1], batch[0]])]) {
+          const single = await ask([probe]);
+          if (single?.answers.size) {
+            readableSeen = true;
+            save([probe], single.answers);
+            rest = batch.filter((it) => it !== probe);
+            break;
+          }
+        }
+        if (!readableSeen) throw formatError(reply.text);
+      }
+      return split(rest, retries);
+    }
+
+    readableSeen = true;
+    streak = 0;
+    const missing = save(batch, reply.answers);
+    if (missing.length && retries > 0) await attempt(missing, retries - 1);
+  }
+
   for (let i = 0; i < items.length; i += batchSize) await attempt(items.slice(i, i + batchSize));
 }
 

@@ -222,10 +222,12 @@ const api = createClient({ getToken, onUnauthorized: refreshToken, fetchImpl, on
 
 function groqClient(key = store.get("groqKey", ""), model = store.get("groqModel", PREFERRED_MODELS[0])) {
   if (!key) return null;
+  // Groq's free limits are per model, so each model has its own daily budget. Shared by
+  // every tab via localStorage, so it holds across reloads.
+  const ledgerKey = `groqLedger:${model}`;
   return createGroq({
     apiKey: key, model, fetchImpl: groqFetch,
-    // Shared by every tab via localStorage, so the daily budget holds across reloads.
-    ledger: { load: () => store.get("groqLedger", []), save: (e) => store.set("groqLedger", e) },
+    ledger: { load: () => store.get(ledgerKey, []), save: (e) => store.set(ledgerKey, e) },
     onWait: (ms) => showPause(ms, "Groq"),
     onPace: (ms) => showPause(ms, "Groq", true),
   });
@@ -348,6 +350,16 @@ async function scanLibrary() {
   const sortable = (tags) => !!bucketForTags(tags, state.buckets);
   const artistTags = store.get("artistTags", {});
   const songTags = store.get("songTags", {});
+  // Earlier versions saved artists the model never actually answered as "unknown" (no
+  // tags), which sent whole libraries to Uncategorized. Forget those once so they're
+  // asked again; from now on only an explicit blank answer is saved as unknown.
+  if (store.get("tagsFormat", 1) < 2) {
+    for (const [id, v] of Object.entries(artistTags)) if (!v.tags?.length) delete artistTags[id];
+    for (const [uri, v] of Object.entries(songTags)) if (!v.tags?.length) delete songTags[uri];
+    store.set("artistTags", artistTags);
+    store.set("songTags", songTags);
+    store.set("tagsFormat", 2);
+  }
   let paused = null;
 
   try {
@@ -843,6 +855,12 @@ async function start() {
   }
   // A login saved for a different Spotify app can't be used with this one.
   if (store.get("token")?.clientId !== clientId()) store.del("token");
+  // The Groq budget used to be one ledger for all models; it belongs to the model in use.
+  const oldLedger = store.get("groqLedger", null);
+  if (oldLedger) {
+    store.set(`groqLedger:${store.get("groqModel", PREFERRED_MODELS[0])}`, oldLedger);
+    store.del("groqLedger");
+  }
   if (store.get("token")) return activeCooldown() ? showCooldown() : scan();
   return clientId() ? show("welcome") : showSetup();
 }
