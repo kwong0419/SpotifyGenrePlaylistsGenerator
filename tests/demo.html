@@ -41,6 +41,11 @@
     fake = new FakeSpotify(demoLibrary());
     groq = demoGroq();
   }
+  // ?models=a,b limits the simulated key to those models, e.g. the gpt-oss models a real
+  // free key has. ?unnumbered=1 makes line replies leave out their numbers.
+  const params = new URLSearchParams(location.search);
+  if (params.get("models")) groq.models = params.get("models").split(",");
+  if (params.get("unnumbered")) groq.unnumbered = true;
   window.__fake = fake;
   window.__groq = groq;
   window.__GS_DEMO__ = {
