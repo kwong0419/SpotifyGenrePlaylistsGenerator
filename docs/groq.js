@@ -41,10 +41,24 @@ export class GroqError extends Error {
 
 /** The free daily allowance (or our share of it) is used up until `resumeAt`. */
 export class GroqDailyLimitError extends Error {
-  constructor(resumeAt) {
+  /**
+   * source "groq": Groq itself refused for the day, so `resumeAt` is Groq's own time.
+   * source "estimate": our own count of today's usage says we're at the safe limit; Groq
+   * may still have some left, so it's fine to ask (see clearUsageEstimates).
+   */
+  constructor(resumeAt, source = "groq") {
     super("Groq's free daily allowance is used up for now.");
     this.resumeAt = resumeAt;
+    this.source = source;
   }
+}
+
+/**
+ * Forgets our own record of today's usage but keeps any time Groq itself gave, so the next
+ * request asks Groq directly. Safe: if Groq is really out it says so, with the exact time.
+ */
+export function clearUsageEstimates(ledger) {
+  ledger.save((ledger.load() || []).filter((e) => e.blockedUntil));
 }
 
 export const estimateTokens = (text) => Math.ceil(text.length / 3.5);
@@ -112,12 +126,12 @@ export function createGroq({
 
   async function waitForBudget(estimated) {
     const blocked = entries().find((e) => e.blockedUntil > now());
-    if (blocked) throw new GroqDailyLimitError(blocked.blockedUntil);
+    if (blocked) throw new GroqDailyLimitError(blocked.blockedUntil, "groq");
     const c = caps();
     // Bigger than a whole minute's allowance: can never be sent, so make the caller split it.
     if (estimated > c.tpm) throw new GroqError("too_large", "Batch is larger than the per-minute allowance");
     const u = usage();
-    if (u.day + estimated > c.tpd || u.dayRequests + 1 > c.rpd) throw new GroqDailyLimitError(dayResumeAt(estimated));
+    if (u.day + estimated > c.tpd || u.dayRequests + 1 > c.rpd) throw new GroqDailyLimitError(dayResumeAt(estimated), "estimate");
     // Per minute: wait until the oldest requests in the last 60s drop out of the window.
     for (let i = 0; i < 100; i++) {
       const m = usage();
@@ -177,7 +191,7 @@ export function createGroq({
           const list = entries();
           list.push({ blockedUntil: now() + wait + 5000 });
           ledger.save(list);
-          throw new GroqDailyLimitError(now() + wait + 5000);
+          throw new GroqDailyLimitError(now() + wait + 5000, "groq");
         }
         if (++rateLimited > 3) throw new GroqError("busy", "Groq keeps asking us to slow down. Try again in a few minutes.");
         onWait(wait + 1000);
@@ -234,11 +248,12 @@ export function createGroq({
   };
 }
 
+/** The models in a key's list that can do text chat (not speech, safety or embedding models). */
+export const chatModels = (available) => available.filter((m) => !/whisper|tts|guard|embed|vision|orpheus|allam/i.test(m));
+
 /** The first model in our preference list that this key can use (or any chat model). */
 export function chooseModel(available) {
-  return PREFERRED_MODELS.find((m) => available.includes(m))
-    || available.find((m) => !/whisper|tts|guard|embed|vision|orpheus|allam/i.test(m))
-    || null;
+  return PREFERRED_MODELS.find((m) => available.includes(m)) || chatModels(available)[0] || null;
 }
 
 // --------------------------------------------------------------------------- tagging
@@ -279,11 +294,14 @@ export function estimateArtistJob(groq, artists, batchSize = ARTIST_BATCH) {
   const tokens = artists.reduce((n, a) => n + estimateTokens(artistLine(a)) + 3 + ARTIST_REPLY_TYPICAL, 0)
     + Math.ceil(artists.length / batchSize) * perBatch;
   const { tpm, tpd, dayLeft } = groq.budget();
+  // Less left than even a small request needs: nothing can be sorted today at all.
+  const smallestRequest = perBatch + 5 * (ARTIST_REPLY_ROOM + 12) + (isReasoningModel(groq.model) ? REASONING_ROOM : 0);
+  if (artists.length && dayLeft < smallestRequest) return { tokens, minutes: 0, days: 1 + Math.ceil(tokens / tpd), todayShare: 0, startsToday: false };
   const today = Math.min(tokens, dayLeft);
   const days = tokens <= dayLeft ? 1 : 1 + Math.ceil((tokens - dayLeft) / tpd);
   // Pacing allows `tpm` tokens a minute; replies take time too, so add a little.
   const minutes = Math.ceil((today / tpm) * 1.15 + 0.5);
-  return { tokens, minutes, days, todayShare: tokens ? today / tokens : 1 };
+  return { tokens, minutes, days, todayShare: tokens ? today / tokens : 1, startsToday: true };
 }
 
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);

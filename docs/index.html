@@ -139,17 +139,26 @@
     <!-- Groq daily allowance used up -->
     <section id="screen-budget" class="card" hidden>
       <p class="step" id="budget-day"></p>
-      <h1>Groq's free allowance is used up for today</h1>
-      <p class="lead">Your library needs more than one day of Groq's free allowance. Everything sorted so far is saved.</p>
+      <h1 id="budget-title">Groq's free allowance is used up for today</h1>
+      <p class="lead" id="budget-lead">Everything sorted so far is saved.</p>
       <div class="bar"><div id="budget-fill"></div></div>
       <p id="budget-progress"></p>
-      <ol class="steps">
-        <li><strong>Now:</strong> make playlists with what's sorted, or just close this tab. Unsorted songs are kept aside, not put in the wrong playlist.</li>
-        <li id="budget-when"></li>
-        <li><strong>Each run adds to the same playlists.</strong> Nothing is duplicated, and songs never end up in two playlists.</li>
-      </ol>
-      <p class="small muted">Can't wait? Each Groq model has its own free daily allowance. Switching the model in Settings (for example to <code>openai/gpt-oss-120b</code>) lets you continue today.</p>
-      <button class="primary" id="budget-continue">Continue with what's sorted</button>
+      <p class="note" id="budget-when"></p>
+
+      <div class="option" id="budget-check-box">
+        <p><strong>Groq may still have some left.</strong> This limit is the app's own cautious count of today's usage, not Groq's. Checking costs nothing: if Groq really is out, it says exactly when it resets.</p>
+        <button class="primary" id="budget-check">Check with Groq now</button>
+      </div>
+
+      <div class="option" id="budget-models-box" hidden>
+        <p><strong>Or continue now with another model.</strong> Each Groq model has its own free daily allowance. Smaller models are faster but may know fewer artists.</p>
+        <div class="copy-row"><select id="budget-model"></select><button class="secondary" id="budget-switch">Use this model</button></div>
+      </div>
+
+      <div class="option" id="budget-continue-box">
+        <p><strong>Or make playlists now</strong> with what's sorted. Unsorted songs are kept aside, not put in the wrong playlist, and the next run adds them to the same playlists. Nothing is duplicated.</p>
+        <button class="secondary" id="budget-continue">Continue with what's sorted</button>
+      </div>
     </section>
 
     <!-- Spotify lockout -->

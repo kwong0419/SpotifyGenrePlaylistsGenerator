@@ -4,7 +4,8 @@ import {
   resolvePlaylists, syncPlaylists, planSync, SpotifyError, RateLimitedError, UNCATEGORIZED, NOT_SORTED_YET,
 } from "./core.js";
 import {
-  createGroq, chooseModel, tagArtists, tagSongs, estimateArtistJob, GroqError, GroqDailyLimitError, PREFERRED_MODELS,
+  createGroq, chooseModel, chatModels, clearUsageEstimates, tagArtists, tagSongs, estimateArtistJob,
+  GroqError, GroqDailyLimitError, PREFERRED_MODELS,
 } from "./groq.js";
 
 const ACCOUNTS = "https://accounts.spotify.com";
@@ -220,14 +221,18 @@ const api = createClient({ getToken, onUnauthorized: refreshToken, fetchImpl, on
 
 // --------------------------------------------------------------------------- Groq
 
+// Groq's free limits are per model, so each model has its own daily budget. Shared by
+// every tab via localStorage, so it holds across reloads.
+const groqLedger = (model) => ({
+  load: () => store.get(`groqLedger:${model}`, []),
+  save: (e) => store.set(`groqLedger:${model}`, e),
+});
+const currentModel = () => store.get("groqModel", PREFERRED_MODELS[0]);
+
 function groqClient(key = store.get("groqKey", ""), model = store.get("groqModel", PREFERRED_MODELS[0])) {
   if (!key) return null;
-  // Groq's free limits are per model, so each model has its own daily budget. Shared by
-  // every tab via localStorage, so it holds across reloads.
-  const ledgerKey = `groqLedger:${model}`;
   return createGroq({
-    apiKey: key, model, fetchImpl: groqFetch,
-    ledger: { load: () => store.get(ledgerKey, []), save: (e) => store.set(ledgerKey, e) },
+    apiKey: key, model, fetchImpl: groqFetch, ledger: groqLedger(model),
     onWait: (ms) => showPause(ms, "Groq"),
     onPace: (ms) => showPause(ms, "Groq", true),
   });
@@ -366,7 +371,9 @@ async function scanLibrary() {
     const need = [...artists.values()].filter((a) => !sortable(spotifyGenres[a.id]));
     const todo = need.filter((a) => !(a.id in artistTags));
     const estimate = estimateArtistJob(groq, todo);
-    if (estimate.minutes >= 3 || estimate.days > 1) {
+    // If nothing fits today, skip the plan: tagArtists stops before sending anything and the
+    // allowance screen offers the ways forward (check with Groq, another model).
+    if (estimate.startsToday && (estimate.minutes >= 3 || estimate.days > 1)) {
       await confirmPlan(estimate, todo.length, need.length - todo.length);
     }
     const startedAt = Date.now();
@@ -464,24 +471,49 @@ function confirmPlan(estimate, todo, alreadySorted) {
   return new Promise((resolve) => { $("plan-start").onclick = () => resolve(); });
 }
 
-/** Groq's daily allowance ran out: show how far along we are, when it resets, and what to do. */
+/**
+ * Groq's daily allowance ran out (or our cautious count says so): show how far along we
+ * are and the ways forward: ask Groq directly, switch to a model with its own allowance,
+ * or make playlists with what's sorted.
+ */
 function showGroqPaused(err, sortedArtists, totalArtists) {
   const pendingSongs = state.groups.find((g) => g.bucket.id === NOT_SORTED_YET.id)?.tracks.length || 0;
   const sortedSongs = state.total - pendingSongs;
-  const daysDone = store.get("groqDays", 0) + 1;
-  store.set("groqDays", daysDone);
-  $("budget-day").textContent = `Day ${daysDone} done`;
+  const model = currentModel();
+  if (sortedSongs) {
+    const daysDone = store.get("groqDays", 0) + 1;
+    store.set("groqDays", daysDone);
+    $("budget-day").textContent = `Day ${daysDone} done`;
+    $("budget-title").textContent = "Groq's free allowance is used up for today";
+    $("budget-lead").textContent = "Everything sorted so far is saved.";
+  } else {
+    $("budget-day").textContent = "";
+    $("budget-title").textContent = "Nothing could be sorted yet";
+    $("budget-lead").textContent = `Today's free allowance for ${model} looks used up, so sorting couldn't start. Nothing is lost.`;
+  }
   $("budget-fill").style.width = `${Math.round((sortedSongs / Math.max(1, state.total)) * 100)}%`;
-  $("budget-progress").textContent = pendingSongs
-    ? `${sortedSongs.toLocaleString()} of ${state.total.toLocaleString()} songs sorted `
-      + `(${sortedArtists.toLocaleString()} of ${totalArtists.toLocaleString()} artists; the ones with the most songs went first).`
-    : `All ${state.total.toLocaleString()} songs have a genre. A few songs by artists who mix genres will be fine-tuned next time.`;
-  $("budget-when").innerHTML = "";
-  const strong = document.createElement("strong");
-  strong.textContent = `After ${formatWhen(err.resumeAt)}:`;
-  $("budget-when").append(strong, " open this page again. It continues where it stopped, without asking Groq about anything already sorted.");
+  $("budget-progress").textContent = `${sortedSongs.toLocaleString()} of ${state.total.toLocaleString()} songs sorted`
+    + (pendingSongs ? ` (${sortedArtists.toLocaleString()} of ${totalArtists.toLocaleString()} artists; the ones with the most songs go first).` : ".");
+  $("budget-when").textContent = err.source === "groq"
+    ? `Groq says ${model}'s allowance resets after ${formatWhen(err.resumeAt)}. Open this page again then and it continues where it stopped.`
+    : `By the app's count, ${model}'s allowance frees up after ${formatWhen(err.resumeAt)}. Open this page again then and it continues where it stopped.`;
+  $("budget-check-box").hidden = err.source !== "estimate";
+  $("budget-continue-box").hidden = sortedSongs === 0;
   document.title = `Paused until ${formatWhen(err.resumeAt)} — ${APP_TITLE}`;
   show("budget");
+  offerOtherModels(model);
+}
+
+/** Fills the "continue with another model" list from the models this key can use. */
+async function offerOtherModels(current) {
+  $("budget-models-box").hidden = true;
+  try {
+    const others = chatModels(await groqClient().listModels()).filter((m) => m !== current);
+    // Best first: our preference order, then the rest.
+    others.sort((a, b) => (PREFERRED_MODELS.indexOf(a) + 1 || 99) - (PREFERRED_MODELS.indexOf(b) + 1 || 99));
+    $("budget-model").replaceChildren(...others.map((m) => Object.assign(document.createElement("option"), { value: m, textContent: m })));
+    $("budget-models-box").hidden = !others.length;
+  } catch { /* the list is optional */ }
 }
 
 function formatWhen(ts) {
@@ -542,7 +574,9 @@ async function showPreview() {
 function renderPreview() {
   const pendingAll = state.groups.find((g) => g.bucket.id === NOT_SORTED_YET.id)?.tracks.length || 0;
   $("ready-banner").hidden = false;
-  $("ready-banner").textContent = pendingAll
+  $("ready-banner").textContent = pendingAll === state.total
+    ? "Nothing is sorted yet. Run again once Groq's allowance is back, or pick another model in Settings."
+    : pendingAll
     ? `✓ Sorting is done for today. ${(state.total - pendingAll).toLocaleString()} of ${state.total.toLocaleString()} songs have a genre.`
     : state.sortedMs > 60000
       ? `✓ Sorting finished in ${minutesText(state.sortedMs)}. Review your genres, then create your playlists.`
@@ -647,13 +681,41 @@ function genreRow(group) {
   text.addEventListener("click", toggleSongs);
   text.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleSongs(); } });
 
-  head.append(box, text, count);
+  if (bucket.id === UNCATEGORIZED.id && tracks.length) {
+    const again = document.createElement("button");
+    again.className = "link again";
+    again.textContent = "Ask again";
+    again.title = "Ask Groq again about the artists in Uncategorized";
+    again.addEventListener("click", (e) => { e.stopPropagation(); askAgain(tracks); });
+    head.append(box, text, count, again);
+  } else {
+    head.append(box, text, count);
+  }
   li.append(head);
   return li;
 }
 
 function syncPlan() {
   return planSync(state.groups, state.targets, state.selected, state.buckets);
+}
+
+/**
+ * Forgets what's saved for the artists behind these songs (Groq's answer, Last.fm tags and
+ * any per-song tags), so the next run asks about them again.
+ */
+function askAgain(tracks) {
+  const artistIds = new Set(tracks.map((t) => t.artistIds[0]).filter(Boolean));
+  if (!confirm(`Ask Groq again about ${artistIds.size.toLocaleString()} artist${artistIds.size === 1 ? "" : "s"} in Uncategorized? `
+    + "This uses some of today's Groq allowance. Artists Groq still doesn't know will stay in Uncategorized.")) return;
+  const artistTags = store.get("artistTags", {});
+  const lfm = store.get("lastfmTags", {});
+  const songTags = store.get("songTags", {});
+  for (const id of artistIds) { delete artistTags[id]; delete lfm[id]; }
+  for (const t of tracks) delete songTags[t.uri];
+  store.set("artistTags", artistTags);
+  store.set("lastfmTags", lfm);
+  store.set("songTags", songTags);
+  scan();
 }
 
 function updateCreateButton() {
@@ -794,6 +856,12 @@ function wire() {
   $("retry-btn").addEventListener("click", scan);
   $("save-groq-key").addEventListener("click", saveGroqKey);
   $("budget-continue").addEventListener("click", showPreview);
+  $("budget-check").addEventListener("click", () => { clearUsageEstimates(groqLedger(currentModel())); scan(); });
+  $("budget-switch").addEventListener("click", () => {
+    if (!$("budget-model").value) return;
+    store.set("groqModel", $("budget-model").value);
+    scan();
+  });
   $("cooldown-retry").addEventListener("click", () => {
     if (!confirm("If Spotify is still paused, trying now restarts the wait and can make it longer. Try anyway?")) return;
     const c = store.get("cooldown", null);
