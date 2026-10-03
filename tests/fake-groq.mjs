@@ -3,7 +3,7 @@
 // Used by the Node tests and by tests/demo.html.
 
 export class FakeGroq {
-  constructor({ artists = {}, songs = {}, models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"] } = {}) {
+  constructor({ artists = {}, songs = {}, models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-120b"] } = {}) {
     this.artists = artists;      // name -> { tags, mixed }
     this.songs = songs;          // title -> tags
     this.models = models;
@@ -65,14 +65,18 @@ export class FakeGroq {
     });
     let content = (this.preamble || "") + answers.join("\n");
     if (this.garbleNext-- > 0 || poisoned) content = "I'm sorry, I can't help with that list.";
-    // Like real Groq: a reply longer than max_tokens is cut off mid-line.
+    // Like gpt-oss on Groq: reasoning models think first, and the thinking uses up
+    // max_tokens before any answer is written (less with reasoning_effort "low").
+    const thinking = /gpt-oss/.test(req.model) ? (req.reasoning_effort === "low" ? 200 : 900) : 0;
+    const room = Math.max(0, req.max_tokens - thinking);
+    // Like real Groq: a reply longer than the room left is cut off mid-line.
     let finish = "stop";
-    if (Math.ceil(content.length / 3.5) > req.max_tokens) {
-      content = content.slice(0, Math.floor(req.max_tokens * 3.5));
+    if (Math.ceil(content.length / 3.5) > room) {
+      content = content.slice(0, Math.floor(room * 3.5));
       finish = "length";
       this.cutOffs = (this.cutOffs || 0) + 1;
     }
-    const completionTokens = Math.ceil(content.length / 3.5);
+    const completionTokens = Math.ceil(content.length / 3.5) + Math.min(thinking, req.max_tokens);
     this.tokensUsed += promptTokens + completionTokens;
     return this.reply(200, {
       choices: [{ message: { content }, finish_reason: finish }],

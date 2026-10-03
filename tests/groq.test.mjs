@@ -275,3 +275,18 @@ test("artists the model skips are asked again, then left for next run rather tha
   assert.equal(Object.keys(cache).length, 28);
   assert.ok(!("a4" in cache) && !("a9" in cache));
 });
+
+test("reasoning models (gpt-oss) are asked to think briefly and given room, so answers aren't empty", async () => {
+  const artists = {};
+  const list = [];
+  for (let i = 0; i < 120; i++) {
+    artists[`Artist Number ${i}`] = { tags: ["conscious hip hop", "west coast rap", "alternative r&b"] };
+    list.push({ id: `a${i}`, name: `Artist Number ${i}`, titles: ["A Song"], songCount: 1 });
+  }
+  const groq = new FakeGroq({ artists });
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const cache = {};
+  await tagArtists(client, list, cache);
+  assert.equal(Object.values(cache).filter((v) => v.tags.length === 3).length, 120);
+  assert.equal(groq.cutOffs || 0, 0, "no answer squeezed out by thinking");
+});

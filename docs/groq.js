@@ -49,6 +49,14 @@ export class GroqDailyLimitError extends Error {
 
 export const estimateTokens = (text) => Math.ceil(text.length / 3.5);
 
+/**
+ * Reasoning models (gpt-oss, qwen3, deepseek-r1...) think before answering, and that
+ * thinking counts against max_tokens: with room for only the answer, they spend it all
+ * thinking and reply with nothing. So they're asked to think briefly, and get extra room.
+ */
+export const isReasoningModel = (model) => /gpt-oss|qwen3|qwq|deepseek-r1|reason/i.test(model || "");
+export const REASONING_ROOM = 1024;
+
 /** "Please try again in 1h2m3.5s" -> ms */
 function parseTryAgain(message) {
   const m = /try again in\s+(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?(?:([\d.]+)ms)?/i.exec(message || "");
@@ -194,12 +202,15 @@ export function createGroq({
      * for it) if it's cut off or malformed, whereas a cut-off text reply is still usable.
      */
     async chatText(system, user, maxTokens) {
+      const reasoning = isReasoningModel(model);
+      if (reasoning) maxTokens += REASONING_ROOM;
       const estimated = estimateTokens(system + user) + maxTokens;
       await waitForBudget(estimated);
       let data;
       try {
         data = await call("/chat/completions", {
           model, temperature: 0, max_tokens: maxTokens,
+          ...(reasoning ? { reasoning_effort: "low", include_reasoning: false } : {}),
           messages: [{ role: "system", content: system }, { role: "user", content: user }],
         });
       } catch (err) {
@@ -263,7 +274,8 @@ const ARTIST_BATCH = 60;
 const SONG_BATCH = 50;
 
 export function estimateArtistJob(groq, artists, batchSize = ARTIST_BATCH) {
-  const perBatch = estimateTokens(ARTIST_PROMPT) + 40;
+  // Reasoning models also think a little per request (asked for low effort: ~a few hundred tokens).
+  const perBatch = estimateTokens(ARTIST_PROMPT) + 40 + (isReasoningModel(groq.model) ? 300 : 0);
   const tokens = artists.reduce((n, a) => n + estimateTokens(artistLine(a)) + 3 + ARTIST_REPLY_TYPICAL, 0)
     + Math.ceil(artists.length / batchSize) * perBatch;
   const { tpm, tpd, dayLeft } = groq.budget();
