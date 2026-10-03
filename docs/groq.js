@@ -237,7 +237,7 @@ export function createGroq({
 /** The first model in our preference list that this key can use (or any chat model). */
 export function chooseModel(available) {
   return PREFERRED_MODELS.find((m) => available.includes(m))
-    || available.find((m) => !/whisper|tts|guard|embed|vision/i.test(m))
+    || available.find((m) => !/whisper|tts|guard|embed|vision|orpheus|allam/i.test(m))
     || null;
 }
 

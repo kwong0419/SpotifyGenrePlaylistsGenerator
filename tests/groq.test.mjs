@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
-  createGroq, chooseModel, tagArtists, tagSongs, GroqError, GroqDailyLimitError, MODEL_LIMITS,
+  parseReplyLines, createGroq, chooseModel, tagArtists, tagSongs, GroqError, GroqDailyLimitError, MODEL_LIMITS,
 } from "../docs/groq.js";
 import { groupTracks } from "../docs/core.js";
 import { FakeGroq } from "./fake-groq.mjs";
@@ -289,4 +289,25 @@ test("reasoning models (gpt-oss) are asked to think briefly and given room, so a
   await tagArtists(client, list, cache);
   assert.equal(Object.values(cache).filter((v) => v.tags.length === 3).length, 120);
   assert.equal(groq.cutOffs || 0, 0, "no answer squeezed out by thinking");
+});
+
+test("the real gpt-oss-120b reply from the first live check parses correctly", () => {
+  const reply = "1: hip hop  \n2: trap  \n3: hip hop, pop | mixed";
+  assert.deepEqual([...parseReplyLines(reply)], [
+    ["1", { tags: ["hip hop"], mixed: false }],
+    ["2", { tags: ["trap"], mixed: false }],
+    ["3", { tags: ["hip hop", "pop"], mixed: true }],
+  ]);
+  const t = (tags) => groupTracks([{ uri: "x", artistIds: ["a"], artistNames: ["A"] }], { a: tags }, BUCKETS)[0].bucket.id;
+  assert.equal(t(["hip hop"]), "hip-hop-rap");
+  assert.equal(t(["trap"]), "hip-hop-rap");
+  assert.equal(t(["hip hop", "pop"]), "hip-hop-rap", "a tie goes to the first tag");
+});
+
+test("the key's real model list picks gpt-oss-120b, and never a speech or safety model", () => {
+  const live = ["whisper-large-v3", "openai/gpt-oss-120b", "openai/gpt-oss-safeguard-20b", "allam-2-7b", "qwen/qwen3.8-27b",
+    "canopylabs/orpheus-arabic-saudi", "meta-llama/llama-prompt-guard-2-86m", "whisper-large-v3-turbo",
+    "canopylabs/orpheus-v1-english", "meta-llama/llama-prompt-guard-2-22m", "openai/gpt-oss-20b"];
+  assert.equal(chooseModel(live), "openai/gpt-oss-120b");
+  assert.equal(chooseModel(live.filter((m) => !m.includes("gpt-oss-120b") && !m.includes("gpt-oss-20b"))), "qwen/qwen3.8-27b");
 });
