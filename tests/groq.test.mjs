@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
-  parseReplyLines, createGroq, chooseModel, clearUsageEstimates, tagArtists, tagSongs, GroqError, GroqDailyLimitError, MODEL_LIMITS,
+  parseReplyLines, parseStructuredReply, createGroq, chooseModel, clearUsageEstimates, tagArtists, tagSongs, GroqError, GroqDailyLimitError, MODEL_LIMITS,
 } from "../docs/groq.js";
 import { groupTracks } from "../docs/core.js";
 import { FakeGroq } from "./fake-groq.mjs";
@@ -335,4 +335,128 @@ test("a limit Groq itself gave is kept when our estimate is cleared", async () =
   const again = await tagArtists(s.client, list, {}).catch((e) => e);
   assert.ok(again instanceof GroqDailyLimitError && again.source === "groq");
   assert.equal(s.groq.requests, 0, "nothing sent while Groq's own block lasts");
+});
+
+// ---- strict structured replies, and the line format as a fallback
+
+/** 300 artists in 6 styles, a few of them unknown to the model and a few mixed. */
+function realisticLibrary(n = 300) {
+  const styles = [["canadian hip hop", "rap"], ["bedroom pop"], ["reggaeton", "trap latino"], ["modern rock"],
+    ["contemporary country"], ["stutter house", "edm"]];
+  const artists = {};
+  const list = [];
+  for (let i = 0; i < n; i++) {
+    const name = `Artist ${i}`;
+    if (i % 23 !== 7) artists[name] = { tags: styles[i % styles.length], mixed: i % 17 === 0 };
+    list.push({ id: `a${i}`, name, titles: [`Song ${i}`], songCount: n - i });
+  }
+  return { artists, list };
+}
+
+/** Every saved answer is that artist's own (never shifted onto someone else). */
+function assertNoWrongAnswers(cache, artists) {
+  for (const [id, v] of Object.entries(cache)) {
+    const expected = artists[`Artist ${id.slice(1)}`]?.tags || [];
+    assert.deepEqual(v.tags, expected, `${id} got someone else's genres`);
+  }
+}
+
+test("with a strict-mode model every request is structured and every artist is sorted", async () => {
+  const { artists, list } = realisticLibrary();
+  const groq = new FakeGroq({ artists });
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const cache = {};
+  await tagArtists(client, list, cache);
+  assert.equal(Object.keys(cache).length, 300, "known and unknown artists all answered");
+  assert.equal(groq.structuredRequests, groq.requests);
+  assertNoWrongAnswers(cache, artists);
+  assert.equal(cache.a0.mixed, true);
+  assert.deepEqual(cache.a7.tags, [], "an artist the model doesn't know is saved as unknown");
+});
+
+test("a structured reply cut off at the length limit keeps every complete answer", async () => {
+  const artists = {};
+  const list = [];
+  // Five long tags each (only three are kept): far more than the reply room per artist.
+  const long = ["progressive melodic metalcore revival", "atmospheric post-hardcore emo", "experimental mathcore ambient",
+    "symphonic deathcore crossover", "blackened melodic hardcore"];
+  for (let i = 0; i < 60; i++) {
+    artists[`Band ${i}`] = { tags: long };
+    list.push({ id: `b${i}`, name: `Band ${i}`, titles: [], songCount: 1 });
+  }
+  const groq = new FakeGroq({ artists });
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const cache = {};
+  await tagArtists(client, list, cache);
+  assert.ok(groq.cutOffs > 0, "replies really were cut off");
+  assert.equal(Object.keys(cache).length, 60);
+  assert.ok(Object.values(cache).every((v) => v.tags.length === 3), "no half-written answers saved");
+});
+
+test("if Groq turns strict mode down, the line format takes over and the run finishes", async () => {
+  const { artists, list } = realisticLibrary(120);
+  const groq = new FakeGroq({ artists });
+  groq.noSchema = true;
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const cache = {};
+  await tagArtists(client, list, cache);
+  assert.equal(Object.keys(cache).length, 120);
+  assertNoWrongAnswers(cache, artists);
+});
+
+test("the live failure: answers without numbers are matched safely, never shifted onto the wrong artist", async () => {
+  const { artists, list } = realisticLibrary(120);
+  const groq = new FakeGroq({ artists });
+  groq.unnumbered = true;
+  groq.omitBlank = true; // and it leaves out the lines for artists it doesn't know
+  const { client } = setup({ groq });
+  const cache = {};
+  await tagArtists(client, list, cache);
+  assertNoWrongAnswers(cache, artists);
+  const known = Object.keys(artists).length;
+  assert.equal(Object.values(cache).filter((v) => v.tags.length).length, known, "every artist the model knows is sorted");
+});
+
+test("the reply from the live failure is not guessed at", () => {
+  const reply = "pop rock\nhip hop\nalternative r&b\nalternative r&b\npop rap\ncontemporary country\nwest coast hip hop";
+  assert.equal(parseReplyLines(reply, 60).size, 0, "60 artists, 7 unnumbered lines: no way to know whose is whose");
+  const five = reply.split("\n").slice(0, 5).join("\n");
+  assert.equal(parseReplyLines(five, 5).size, 5, "one line per artist in a batch of up to 5: safe to match by position");
+  assert.equal(parseReplyLines(five, 6).size, 0, "one line missing: no way to know which, so nothing is matched");
+  assert.equal(parseReplyLines("I'm sorry, I can't help with that list.", 1).size, 0, "chatter is never taken as tags");
+});
+
+test("structured replies: complete, cut off, and with stray or duplicate numbers", () => {
+  const full = JSON.stringify({ results: [{ n: 1, tags: ["Hip Hop", "unknown"], mixed: false }, { n: 2, tags: [], mixed: false },
+    { n: 2, tags: ["pop"], mixed: true }, { n: 9, tags: ["jazz"], mixed: false }] });
+  assert.deepEqual([...parseStructuredReply(full, 3)], [["1", { tags: ["hip hop"], mixed: false }], ["2", { tags: [], mixed: false }]]);
+  const cut = '{"results":[{"n":1,"tags":["trap"],"mixed":true},{"n":2,"tags":["bedroom pop"],"mixed":false},{"n":3,"tags":["modern ro';
+  assert.deepEqual([...parseStructuredReply(cut, 3)].map(([n, v]) => [n, v.tags]), [["1", ["trap"]], ["2", ["bedroom pop"]]]);
+});
+
+test("a strict-mode model that chokes on one artist: the other 59 are sorted, that one waits", async () => {
+  const { artists, list } = realisticLibrary(60);
+  const groq = new FakeGroq({ artists });
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const cache = {};
+  await tagArtists(client, list.slice(0, 5), cache);
+  groq.poison = "Artist 31";
+  await tagArtists(client, list, cache);
+  assert.ok(!("a31" in cache));
+  assert.equal(Object.keys(cache).length, 59);
+  assertNoWrongAnswers(cache, artists);
+});
+
+test("the real strict-mode reply from gpt-oss-120b parses, whole or cut off part-way", () => {
+  const reply = "{\n  \"results\": [\n    {\n      \"n\": 1,\n      \"tags\": [\"hip hop\", \"rap\", \"r&b\"],\n      \"mixed\": true\n    },\n    {\n      \"n\": 2,\n      \"tags\": [\"trap\", \"hip hop\"],\n      \"mixed\": false\n    },\n    {\n      \"n\": 3,\n      \"tags\": [\"hip hop\", \"rap\", \"electropop\"],\n      \"mixed\": true\n    }\n  ]\n}";
+  assert.deepEqual([...parseStructuredReply(reply, 3)], [
+    ["1", { tags: ["hip hop", "rap", "r&b"], mixed: true }],
+    ["2", { tags: ["trap", "hip hop"], mixed: false }],
+    ["3", { tags: ["hip hop", "rap", "electropop"], mixed: true }],
+  ]);
+  const cut = reply.slice(0, reply.indexOf("\"electropop\""));
+  assert.deepEqual([...parseStructuredReply(cut, 3)].map(([n]) => n), ["1", "2"], "complete answers kept, the half-written one skipped");
+  const where = (tags) => groupTracks([{ uri: "x", artistIds: ["a"], artistNames: ["A"] }], { a: tags }, BUCKETS)[0].bucket.id;
+  assert.equal(where(["hip hop", "rap", "r&b"]), "hip-hop-rap");
+  assert.equal(where(["trap", "hip hop"]), "hip-hop-rap");
 });
