@@ -446,3 +446,17 @@ test("a strict-mode model that chokes on one artist: the other 59 are sorted, th
   assert.equal(Object.keys(cache).length, 59);
   assertNoWrongAnswers(cache, artists);
 });
+
+test("the real strict-mode reply from gpt-oss-120b parses, whole or cut off part-way", () => {
+  const reply = "{\n  \"results\": [\n    {\n      \"n\": 1,\n      \"tags\": [\"hip hop\", \"rap\", \"r&b\"],\n      \"mixed\": true\n    },\n    {\n      \"n\": 2,\n      \"tags\": [\"trap\", \"hip hop\"],\n      \"mixed\": false\n    },\n    {\n      \"n\": 3,\n      \"tags\": [\"hip hop\", \"rap\", \"electropop\"],\n      \"mixed\": true\n    }\n  ]\n}";
+  assert.deepEqual([...parseStructuredReply(reply, 3)], [
+    ["1", { tags: ["hip hop", "rap", "r&b"], mixed: true }],
+    ["2", { tags: ["trap", "hip hop"], mixed: false }],
+    ["3", { tags: ["hip hop", "rap", "electropop"], mixed: true }],
+  ]);
+  const cut = reply.slice(0, reply.indexOf("\"electropop\""));
+  assert.deepEqual([...parseStructuredReply(cut, 3)].map(([n]) => n), ["1", "2"], "complete answers kept, the half-written one skipped");
+  const where = (tags) => groupTracks([{ uri: "x", artistIds: ["a"], artistNames: ["A"] }], { a: tags }, BUCKETS)[0].bucket.id;
+  assert.equal(where(["hip hop", "rap", "r&b"]), "hip-hop-rap");
+  assert.equal(where(["trap", "hip hop"]), "hip-hop-rap");
+});
