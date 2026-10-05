@@ -221,18 +221,20 @@ export function bucketForTags(tags, buckets) {
 }
 
 /**
- * The single bucket a track belongs to. A song's own tags win (used for artists whose
- * songs span different genres); otherwise its main artist's tags decide, with featured
- * artists consulted only when the main artist has nothing usable.
+ * The single bucket a track belongs to, from the most specific evidence down:
+ *   1. the song's own tags (for artists whose songs span different genres)
+ *   2. its main artist's tags, then its featured artists' tags
+ *   3. the playlist picked for its main artist in the second pass (`picks`: artist id ->
+ *      bucket id), for artists whose tags didn't match any playlist
  */
-export function classifyTrack(track, artistGenres, buckets, songGenres = {}) {
+export function classifyTrack(track, artistGenres, buckets, songGenres = {}, picks = {}) {
   const own = bucketForTags(songGenres[track.uri], buckets);
   if (own) return own;
   for (const aid of track.artistIds) {
     const b = bucketForTags(artistGenres[aid], buckets);
     if (b) return b;
   }
-  return UNCATEGORIZED;
+  return buckets.find((b) => b.id === picks[track.artistIds[0]]) || UNCATEGORIZED;
 }
 
 /** "Song - 2011 Remaster" and "Song (Remastered)" are the same song. */
@@ -269,11 +271,11 @@ export function dedupeTracks(tracks) {
  * bucket id -> { bucket, tracks[] } in genres.json order, then Uncategorized, then
  * Not sorted yet (tracks for which `isPending(track)` is true).
  */
-export function groupTracks(tracks, artistGenres, buckets, { songGenres = {}, isPending = () => false } = {}) {
+export function groupTracks(tracks, artistGenres, buckets, { songGenres = {}, isPending = () => false, picks = {} } = {}) {
   const all = [...buckets, UNCATEGORIZED, NOT_SORTED_YET];
   const groups = new Map(all.map((b) => [b.id, { bucket: b, tracks: [] }]));
   for (const t of tracks) {
-    const bucket = isPending(t) ? NOT_SORTED_YET : classifyTrack(t, artistGenres, buckets, songGenres);
+    const bucket = isPending(t) ? NOT_SORTED_YET : classifyTrack(t, artistGenres, buckets, songGenres, picks);
     groups.get(bucket.id).tracks.push(t);
   }
   return [...groups.values()].filter((g) => g.tracks.length);

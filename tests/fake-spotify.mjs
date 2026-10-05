@@ -103,6 +103,7 @@ export function demoLibrary() {
     "Burna Boy": ["afrobeats", "nigerian pop"],
     "Bill Evans": ["cool jazz", "jazz", "jazz piano"],
     "Small Local Band": [],
+    "Clifton Chenier": ["zydeco"],
   };
   const titles = ["Midnight", "Golden Hour", "Paper Planes", "Runaway", "Satellite", "Echoes", "Wildfire",
     "Neon Lights", "Daydream", "Silver Lining", "After Hours", "Ocean Drive", "Heartbeat", "Northern Star"];
@@ -110,7 +111,7 @@ export function demoLibrary() {
   let i = 0;
   const names = Object.keys(artists);
   names.forEach((artist, a) => {
-    const n = [22, 14, 12, 18, 9, 11, 8, 6, 7, 4, 3, 5][a];
+    const n = [22, 14, 12, 18, 9, 11, 8, 6, 7, 4, 3, 5, 6][a];
     for (let k = 0; k < n; k++) {
       liked.push({
         added_at: new Date(Date.UTC(2026, 8, 30) - i * 864e5).toISOString(),
