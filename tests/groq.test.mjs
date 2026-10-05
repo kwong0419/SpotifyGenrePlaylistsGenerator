@@ -5,9 +5,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
-  parseReplyLines, parseStructuredReply, createGroq, chooseModel, clearUsageEstimates, tagArtists, tagSongs, GroqError, GroqDailyLimitError, MODEL_LIMITS,
+  parseReplyLines, parseStructuredReply, createGroq, chooseModel, clearUsageEstimates, pickPlaylists, tagArtists, tagSongs, GroqError, GroqDailyLimitError, MODEL_LIMITS,
 } from "../docs/groq.js";
-import { groupTracks } from "../docs/core.js";
+import { groupTracks, classifyTrack } from "../docs/core.js";
 import { FakeGroq } from "./fake-groq.mjs";
 
 const BUCKETS = JSON.parse(readFileSync(new URL("../docs/genres.json", import.meta.url))).buckets;
@@ -459,4 +459,44 @@ test("the real strict-mode reply from gpt-oss-120b parses, whole or cut off part
   const where = (tags) => groupTracks([{ uri: "x", artistIds: ["a"], artistNames: ["A"] }], { a: tags }, BUCKETS)[0].bucket.id;
   assert.equal(where(["hip hop", "rap", "r&b"]), "hip-hop-rap");
   assert.equal(where(["trap", "hip hop"]), "hip-hop-rap");
+});
+
+// ---- second pass: picking a playlist for artists whose tags fit none
+
+test("artists whose tags fit no playlist get one picked from the real list, or 'none'", async () => {
+  const groq = new FakeGroq();
+  groq.picks = { "Sidhu Moose Wala": "world-regional", "Tiny Local Band": "none" };
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const picks = {};
+  await pickPlaylists(client, [
+    { id: "s", name: "Sidhu Moose Wala", tags: ["punjabi hip-hop drill"], titles: ["295"], featured: [], songCount: 9 },
+    { id: "t", name: "Tiny Local Band", tags: [], titles: ["Song A"], featured: [], songCount: 2 },
+  ], BUCKETS, picks);
+  assert.deepEqual(picks, { s: "world-regional", t: "none" });
+  assert.equal(groq.structuredRequests, 1, "strict mode: the answer can only be a real playlist id");
+  await pickPlaylists(client, [{ id: "s", name: "Sidhu Moose Wala", tags: [], titles: [], featured: [], songCount: 1 }], BUCKETS, picks);
+  assert.equal(groq.pickRequests, 1, "saved picks aren't asked again");
+});
+
+test("in the line format, a pick that isn't a real playlist is never saved", async () => {
+  const groq = new FakeGroq();
+  groq.picks = { "Real Pick": "Hip-Hop & Rap", "Made Up": "bollywood bangers" };
+  const { client } = setup({ groq }); // llama: line format
+  const picks = {};
+  await pickPlaylists(client, [
+    { id: "r", name: "Real Pick", tags: [], titles: [], featured: [], songCount: 2 },
+    { id: "m", name: "Made Up", tags: [], titles: [], featured: [], songCount: 1 },
+  ], BUCKETS, picks);
+  assert.equal(picks.r, "hip-hop-rap", "a playlist named instead of its id is understood");
+  assert.ok(!("m" in picks), "an invented playlist is ignored and asked again next run");
+});
+
+test("a pick places songs only when nothing more specific does", () => {
+  const t = (artistIds, uri = "u") => ({ uri, artistIds, artistNames: artistIds });
+  const genres = { known: ["modern rock"], odd: ["zydeco"], feat: ["trap"] };
+  const picks = { odd: "folk-acoustic", known: "jazz" };
+  assert.equal(classifyTrack(t(["known"]), genres, BUCKETS, {}, picks).id, "rock", "the artist's own tags win over a pick");
+  assert.equal(classifyTrack(t(["odd", "feat"]), genres, BUCKETS, {}, picks).id, "hip-hop-rap", "so do a featured artist's tags");
+  assert.equal(classifyTrack(t(["odd"]), genres, BUCKETS, {}, picks).id, "folk-acoustic");
+  assert.equal(classifyTrack(t(["nobody"]), genres, BUCKETS, {}, picks).id, "uncategorized");
 });

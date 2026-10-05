@@ -32,7 +32,15 @@ account for about a day. So instead of asking Spotify for each artist's genres, 
 3. For artists whose songs span different genres (say, hip hop and rock), it tags each of their
    songs separately, so the songs can land in different playlists.
 4. Runs the tags through the keyword rules in [`docs/genres.json`](docs/genres.json) to pick one of
-   about 20 playlists per song. Optionally, Last.fm fills in artists the model didn't know.
+   24 playlists per song. Optionally, Last.fm fills in artists the model didn't know.
+5. For artists whose tags still fit no playlist, a second pass asks the model to pick the best
+   playlist from the actual list, using everything known (tags, Last.fm tags, who they work with,
+   their songs). The answer can only be a real playlist or "none", and artists with no basis to
+   place them stay in **Uncategorized** rather than being guessed. The preview says why songs are
+   left there, and **Ask again** on that row re-sorts just those artists.
+
+Groq replies use [strict structured outputs](https://console.groq.com/docs/structured-outputs) where
+the model supports them, so the reply format can't drift; other models answer in numbered lines.
 
 Results are saved in your browser, so later runs only send newly liked artists. A 7,400-song
 library takes about 350 Spotify requests on the first run and only a handful after that.

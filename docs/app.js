@@ -4,7 +4,7 @@ import {
   resolvePlaylists, syncPlaylists, planSync, SpotifyError, RateLimitedError, UNCATEGORIZED, NOT_SORTED_YET,
 } from "./core.js";
 import {
-  createGroq, chooseModel, chatModels, clearUsageEstimates, tagArtists, tagSongs, estimateArtistJob,
+  createGroq, chooseModel, chatModels, clearUsageEstimates, tagArtists, tagSongs, pickPlaylists, estimateArtistJob,
   GroqError, GroqDailyLimitError, PREFERRED_MODELS,
 } from "./groq.js";
 
@@ -436,9 +436,69 @@ async function scanLibrary() {
     for (const id of artists.keys()) if (!sortable(genres[id]) && sortable(lfm[id])) genres[id] = lfm[id];
   }
 
+  // Second pass: artists whose tags still don't fit any playlist (or who had none) get a
+  // playlist picked directly from the real list, using everything known about them:
+  // Groq's and Last.fm's tags, who they work with, and their songs. "none" keeps them in
+  // Uncategorized rather than guessing.
+  const lfmSaved = store.get("lastfmTags", {});
+  // Picks only make sense for the playlist list they were chosen from; if it changes
+  // (say a new genre is added to genres.json), ask again.
+  const listId = state.buckets.map((x) => x.id).join(",");
+  if (store.get("playlistPicksFor", "") !== listId) {
+    store.del("playlistPicks");
+    store.set("playlistPicksFor", listId);
+  }
+  const picks = store.get("playlistPicks", {});
+  if (!paused) {
+    const featured = new Map(); // main artist id -> names of artists on their songs
+    for (const t of tracks) {
+      const id = t.artistIds[0];
+      if (!id) continue;
+      const names = featured.get(id) || new Set();
+      for (const n of t.artistNames.slice(1)) if (names.size < 4) names.add(n);
+      featured.set(id, names);
+    }
+    const unplaced = [...artists.values()]
+      .filter((a) => a.id in artistTags && !sortable(genres[a.id]) && !(a.id in picks))
+      .map((a) => ({ ...a, tags: artistTags[a.id]?.tags || [], lastfm: lfmSaved[a.id] || [], featured: [...(featured.get(a.id) || [])] }));
+    if (unplaced.length) {
+      const pickLine = liveProgress("Placing the remaining artists…", "artists",
+        ((unplaced.length * 40) / groq.budget().tpm) * 60000 * 1.15, STEPS.sort);
+      try {
+        await pickPlaylists(groq, unplaced, state.buckets, picks, {
+          onProgress: (done, total) => pickLine.update(done, total),
+          onSaved: (c) => saveThrottled("playlistPicks", c),
+        });
+      } catch (err) {
+        if (!(err instanceof GroqDailyLimitError)) throw err;
+        paused = err;
+      } finally {
+        pickLine.stop();
+        saveThrottled("playlistPicks", picks, true);
+      }
+    }
+  }
+
   const songGenres = Object.fromEntries(Object.entries(songTags).map(([uri, v]) => [uri, v.tags]));
   const isPending = (t) => !!t.artistIds[0] && !sortable(spotifyGenres[t.artistIds[0]]) && !(t.artistIds[0] in artistTags);
-  state.groups = groupTracks(tracks, genres, state.buckets, { songGenres, isPending });
+  const pickedBuckets = Object.fromEntries(Object.entries(picks).filter(([, v]) => v !== "none"));
+  state.groups = groupTracks(tracks, genres, state.buckets, { songGenres, isPending, picks: pickedBuckets });
+
+  // Why what's left in Uncategorized is there: artists nobody knows, or genres no playlist covers.
+  const leftover = state.groups.find((g) => g.bucket.id === UNCATEGORIZED.id)?.tracks || [];
+  const tagCounts = new Map();
+  let unknownSongs = 0;
+  for (const t of leftover) {
+    const id = t.artistIds[0];
+    const known = [...(artistTags[id]?.tags || []), ...(lfmSaved[id] || [])];
+    if (!known.length) { unknownSongs++; continue; }
+    for (const tag of new Set(known)) tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
+  }
+  state.leftover = {
+    unknownSongs,
+    unmatchedSongs: leftover.length - unknownSongs,
+    topTags: [...tagCounts].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([tag]) => tag),
+  };
   state.selected = new Set(state.groups
     .filter((g) => ![UNCATEGORIZED.id, NOT_SORTED_YET.id].includes(g.bucket.id) && g.tracks.length >= MIN_SONGS_PRESELECTED)
     .map((g) => g.bucket.id));
@@ -586,7 +646,17 @@ function renderPreview() {
   const genreCount = state.groups.filter((g) => ![UNCATEGORIZED.id, NOT_SORTED_YET.id].includes(g.bucket.id)).length;
   const parts = [`${state.total.toLocaleString()} songs in ${genreCount} genres.`];
   if (state.dupesRemoved) parts.push(`${state.dupesRemoved} duplicate${state.dupesRemoved === 1 ? "" : "s"} skipped.`);
-  if (uncategorized) parts.push(`${uncategorized} song${uncategorized === 1 ? "" : "s"} couldn't be matched to a genre.`);
+  if (uncategorized) {
+    const why = [];
+    const l = state.leftover || {};
+    if (l.unknownSongs) why.push(`${l.unknownSongs.toLocaleString()} by artists Groq doesn't recognise`);
+    if (l.unmatchedSongs) {
+      why.push(`${l.unmatchedSongs.toLocaleString()} with genres no playlist covers`
+        + (l.topTags?.length ? ` (like ${l.topTags.map((t) => `"${t}"`).join(", ")})` : ""));
+    }
+    parts.push(`${uncategorized.toLocaleString()} song${uncategorized === 1 ? "" : "s"} couldn't be matched to a genre`
+      + (why.length ? `: ${why.join("; ")}.` : "."));
+  }
   const pending = state.groups.find((g) => g.bucket.id === NOT_SORTED_YET.id)?.tracks.length || 0;
   if (pending) {
     parts.push(`${pending.toLocaleString()} song${pending === 1 ? " isn't" : "s aren't"} sorted yet${state.groqResumeAt
@@ -710,7 +780,9 @@ function askAgain(tracks) {
   const artistTags = store.get("artistTags", {});
   const lfm = store.get("lastfmTags", {});
   const songTags = store.get("songTags", {});
-  for (const id of artistIds) { delete artistTags[id]; delete lfm[id]; }
+  const picks = store.get("playlistPicks", {});
+  for (const id of artistIds) { delete artistTags[id]; delete lfm[id]; delete picks[id]; }
+  store.set("playlistPicks", picks);
   for (const t of tracks) delete songTags[t.uri];
   store.set("artistTags", artistTags);
   store.set("lastfmTags", lfm);
@@ -889,7 +961,7 @@ function wire() {
   });
   $("refresh-genres").addEventListener("click", () => {
     if (!confirm("Sort every artist again from scratch? This uses Groq's daily allowance again, so a big library may take more than a day.")) return;
-    ["artists", "artistTags", "songTags", "lastfmTags"].forEach((k) => store.del(k));
+    ["artists", "artistTags", "songTags", "lastfmTags", "playlistPicks"].forEach((k) => store.del(k));
     $("settings").close();
     if (store.get("token")) scan();
   });

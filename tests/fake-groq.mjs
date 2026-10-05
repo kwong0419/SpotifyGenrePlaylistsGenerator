@@ -24,6 +24,8 @@ export class FakeGroq {
     this.omitBlank = false;      // line replies skip the lines for unknown items
     this.noSchema = false;       // turn down strict structured output (400)
     this.structuredRequests = 0;
+    this.picks = {};             // artist name -> playlist id, for "pick a playlist" requests
+    this.pickRequests = 0;
     this.calls = [];             // number of items in each completion request
   }
   reply(status, body) {
@@ -67,6 +69,22 @@ export class FakeGroq {
       } });
     }
     if (structured) this.structuredRequests++;
+
+    // "Pick a playlist" requests (the second pass for artists still uncategorized).
+    if (req.messages[0].content.startsWith("You sort music artists into playlists")) {
+      this.pickRequests++;
+      const picks = lines.map((line, i) => {
+        const name = /^\d+\. (.*?)(?: \(.*\))?$/.exec(line)[1];
+        return { n: i + 1, playlist: this.picks[name] || "none" };
+      });
+      const content = structured ? JSON.stringify({ results: picks }) : picks.map((p) => `${p.n}: ${p.playlist}`).join("\n");
+      const completionTokens = Math.ceil(content.length / 3.5);
+      this.tokensUsed += promptTokens + completionTokens;
+      return this.reply(200, {
+        choices: [{ message: { content }, finish_reason: "stop" }],
+        usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
+      });
+    }
 
     const answers = [];
     lines.forEach((line, i) => {
@@ -115,7 +133,7 @@ export class FakeGroq {
 
 /** Groq's view of the demo library's artists (see demoLibrary in fake-spotify.mjs). */
 export function demoGroq() {
-  return new FakeGroq({
+  const groq = new FakeGroq({
     artists: {
       "Kendrick Lamar": { tags: ["conscious hip hop", "west coast rap"] },
       "Phoebe Bridgers": { tags: ["indie pop", "la indie"] },
@@ -129,8 +147,12 @@ export function demoGroq() {
       "Burna Boy": { tags: ["afrobeats", "nigerian pop"] },
       "Bill Evans": { tags: ["cool jazz", "jazz piano"] },
       // "Small Local Band" is unknown to the model on purpose.
+      "Clifton Chenier": { tags: ["zydeco", "cajun"] }, // genres no playlist's keywords cover
     },
     // Taylor Swift's early songs are country, the rest pop.
     songs: { Midnight: ["contemporary country"], "Golden Hour": ["contemporary country"], "Paper Planes": ["country pop"] },
   });
+  // The second pass: asked to pick a playlist, the model places zydeco under Folk.
+  groq.picks = { "Clifton Chenier": "folk-acoustic" };
+  return groq;
 }
