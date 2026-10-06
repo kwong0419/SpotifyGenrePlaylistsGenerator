@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Accuracy check demo (simulated Groq)</title>
+  <link rel="stylesheet" href="../docs/style.css">
+  <style>.demo-banner { background: #fff1c2; color: #3d2f00; text-align: center; padding: 8px 16px; font-size: .875rem; }</style>
+</head>
+<body>
+<script type="module">
+  // Runs the real accuracy check against a simulated Groq that gets most songs right, puts
+  // some in a sibling subgenre or the wrong genre, and doesn't know a few.
+  import { FakeGroq } from "./fake-groq.mjs";
+
+  const bench = await (await fetch("../docs/benchmark.json", { cache: "no-store" })).json();
+  const songs = {};
+  bench.songs.forEach((s, i) => {
+    const key = `${s.title} by ${s.artist}`;
+    if (i % 17 === 3) return;                                   // doesn't know it
+    if (i % 11 === 4) songs[key] = s.ok[0] === "house" ? "deep-house" : "pop"; // a near or plain miss
+    else songs[key] = s.ok[0];
+  });
+  const groq = new FakeGroq({ songs, models: ["openai/gpt-oss-120b"] });
+  window.__groq = groq;
+  window.__GS_DEMO__ = { groqFetch: groq.fetch };
+  localStorage.setItem("gs-demo.groqKey", JSON.stringify("gsk_demo"));
+  localStorage.setItem("gs-demo.groqModel", JSON.stringify("openai/gpt-oss-120b"));
+  Object.keys(localStorage).filter((k) => k.startsWith("gs-demo.groqLedger")).forEach((k) => localStorage.removeItem(k));
+
+  const html = await (await fetch("../docs/accuracy.html", { cache: "no-store" })).text();
+  const page = new DOMParser().parseFromString(html, "text/html");
+  page.querySelectorAll("script").forEach((s) => s.remove());
+  const banner = document.createElement("div");
+  banner.className = "demo-banner";
+  banner.textContent = "Demo with a simulated Groq. Nothing here touches the real service.";
+  page.body.prepend(banner);
+  document.body.replaceWith(document.adoptNode(page.body));
+  await import("../docs/accuracy.js");
+</script>
+</body>
+</html>

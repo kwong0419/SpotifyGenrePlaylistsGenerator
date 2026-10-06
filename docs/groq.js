@@ -1,8 +1,8 @@
-// Genre tagging with Groq (free LLM API), instead of one Spotify request per artist.
+// Sorting songs into playlists with Groq (free LLM API).
 //
-// The model tags each artist with Spotify-style genres ("chicago drill", "bedroom pop");
-// those tags then go through the same keyword rules as Spotify's own genres. Artists
-// whose songs span different genres are flagged, and their songs are tagged one by one.
+// Every song is judged on its own: the model picks the most specific playlist it fits
+// from the list in taxonomy.json (or "none"), so an artist's songs can land in different
+// playlists. Nothing is decided by keyword matching.
 //
 // Guardrails, so Groq never blocks us:
 //   * every request is budgeted before it's sent: per minute (tokens and requests) and
@@ -261,50 +261,92 @@ export function chooseModel(available) {
   return PREFERRED_MODELS.find((m) => available.includes(m)) || chatModels(available)[0] || null;
 }
 
-// --------------------------------------------------------------------------- tagging
+// --------------------------------------------------------------------------- sorting songs
 
 /** Models Groq runs in strict structured-output mode (constrained decoding). */
 export const supportsStrictOutput = (model) => /^openai\/gpt-oss-\d+b$|^qwen\/qwen3/i.test(model || "");
+const modeFor = (model) => (supportsStrictOutput(model) ? "json" : "lines");
 
-const ARTIST_TASK = `You tag music artists with genres the way Spotify does on artist pages.
-For each numbered artist (with example songs from the listener's library), give 1-3 Spotify-style genre tags, most representative first, lowercase, e.g. "chicago drill", "bedroom pop", "classic oklahoma country", "k-pop girl group", "reggaeton", "uk garage", "art pop".
-If you don't confidently recognise the artist, give no tags. Never guess from the name alone.
-Mark the artist as mixed when their songs clearly span different broad genres (e.g. both hip hop and rock, or both country and pop).`;
+const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
-const SONG_TASK = `You tag individual songs with genres the way Spotify would.
-For each numbered song, give 1-2 Spotify-style genre tags describing that specific song (not the artist in general), lowercase, e.g. "pop rap", "alternative rock", "contemporary country", "dance pop".
-If you don't confidently know the song, give no tags. Never guess.`;
+// Reply room per song. A structured answer {"n":12,"playlist":"deep-house"} is ~14 tokens
+// (more when the model spaces it out); a line "12: deep-house" ~6. Room is generous so
+// replies are rarely cut off, and a cut-off reply still yields its complete answers.
+const ROOM = { json: 22, lines: 10 };
+const TYPICAL = { json: 14, lines: 6 };
+// The playlist list is ~1,200 tokens per request, so bigger batches waste less on repeating
+// it; 90 songs keeps a request (with its reply room) under gpt-oss-120b's per-minute cap.
+const SONG_BATCH = 90;
+
+/** The instructions, with the playlist list (subgenres indented under their genre). */
+export function sortingTask(nodes) {
+  const list = nodes.map((n) => `${n.parent ? "  " : ""}${n.id}: ${n.name} (${n.hint})`).join("\n");
+  return `You sort songs into playlists. For each numbered song, pick the most specific playlist it fits, from this list (answer with the id). Indented entries are subgenres of the entry above: pick a subgenre when the song clearly fits it, otherwise the broad genre.
+${list}
+Judge each song itself, not just its artist: an artist's songs can belong in different playlists. Use what you know about the song and the artist, and any listener tags given. Answer "none" only if you don't recognise the song or its artist and nothing given places it; never guess from a name alone.`;
+}
 
 const FORMAT = {
-  artist: {
-    json: "Give exactly one result per numbered artist, with its number n.",
-    lines: `Reply with exactly one line per artist, starting with its number, in order, and nothing else:
-1: chicago drill, drill
-2:
-3: country pop, pop | mixed`,
-  },
-  song: {
-    json: "Give exactly one result per numbered song, with its number n.",
-    lines: `Reply with exactly one line per song, starting with its number, in order, and nothing else:
-1: pop rap
-2:
-3: alternative rock, pop rock`,
-  },
+  json: "Give exactly one result per numbered song, with its number n.",
+  lines: "Reply with exactly one line per song, starting with its number, and nothing else, e.g.\n1: deep-house\n2: none",
 };
 
-const resultSchema = (withMixed) => ({
+const songLine = (s) => {
+  const extra = [];
+  if (s.featured?.length) extra.push(`feat. ${s.featured.map((f) => clip(f, 30)).join(", ")}`);
+  if (s.context?.length) extra.push(`listener tags for the artist: ${s.context.join(", ")}`);
+  return `"${clip(s.title, 70)}" by ${clip(s.artist, 40)}${extra.length ? ` (${extra.join("; ")})` : ""}`;
+};
+
+/**
+ * Reading answers. Only a real playlist id (or its exact name, or "none") is accepted:
+ * strict mode can't produce anything else, and in the line format anything else is
+ * ignored and asked again. Numbers outside 1..count are ignored; the first answer wins.
+ */
+export function answerReader(nodes) {
+  const lookup = new Map(nodes.flatMap((n) => [[n.id, n.id], [n.name.toLowerCase(), n.id]]));
+  const valid = (v) => {
+    const k = String(v ?? "").trim().replace(/^["'`*]+|["'`*.]+$/g, "").toLowerCase();
+    return k === "none" ? "none" : lookup.get(k) || null;
+  };
+  const json = (text, count) => {
+    const out = new Map();
+    const add = (n, pick) => {
+      const v = valid(pick);
+      const k = String(n);
+      if (v && Number.isInteger(+n) && +n >= 1 && +n <= count && !out.has(k)) out.set(k, v);
+    };
+    try {
+      const data = JSON.parse(text);
+      for (const r of Array.isArray(data?.results) ? data.results : []) add(r?.n, r?.playlist);
+      return out;
+    } catch { /* cut off: pick out the complete answers */ }
+    for (const m of text.matchAll(/\{\s*"n"\s*:\s*(\d+)\s*,\s*"playlist"\s*:\s*"([^"]*)"\s*\}/g)) add(+m[1], m[2]);
+    return out;
+  };
+  const lines = (text, count, cutOff) => {
+    let rows = text.split(/\r?\n/);
+    if (cutOff) rows = rows.slice(0, -1); // the last line may be half-written
+    const out = new Map();
+    for (const raw of rows) {
+      const m = /^\s*[*-]?\s*\**(\d+)\**\s*[:.)\]–-]\s*(.*)$/.exec(raw);
+      const v = m && valid(m[2]);
+      if (v && +m[1] >= 1 && +m[1] <= count && !out.has(m[1])) out.set(m[1], v);
+    }
+    return out;
+  };
+  return { json, lines };
+}
+
+const answerSchema = (nodes) => ({
   type: "object",
   properties: {
     results: {
       type: "array",
       items: {
         type: "object",
-        properties: {
-          n: { type: "integer" },
-          tags: { type: "array", items: { type: "string" } },
-          ...(withMixed ? { mixed: { type: "boolean" } } : {}),
-        },
-        required: withMixed ? ["n", "tags", "mixed"] : ["n", "tags"],
+        properties: { n: { type: "integer" }, playlist: { type: "string", enum: [...nodes.map((n) => n.id), "none"] } },
+        required: ["n", "playlist"],
         additionalProperties: false,
       },
     },
@@ -312,122 +354,64 @@ const resultSchema = (withMixed) => ({
   required: ["results"],
   additionalProperties: false,
 });
-const SCHEMA = { artist: resultSchema(true), song: resultSchema(false) };
-
-// Reply room per item. A structured answer like {"n":12,"tags":["conscious hip hop",
-// "west coast rap"],"mixed":false} is ~24 tokens; a line "12: conscious hip hop, west
-// coast rap" ~14. Room is generous so replies are rarely cut off (and a cut-off reply
-// still yields its complete answers); estimates use the typical size.
-const ROOM = { artist: { json: 36, lines: 24 }, song: { json: 28, lines: 16 } };
-const TYPICAL = { artist: { json: 24, lines: 14 }, song: { json: 18, lines: 10 } };
-const ARTIST_BATCH = 60;
-const SONG_BATCH = 50;
-
-const modeFor = (model) => (supportsStrictOutput(model) ? "json" : "lines");
 
 /**
- * Roughly how long tagging these artists will take and how much of the daily allowance
- * it needs: { tokens, minutes, days, todayShare, startsToday }. days > 1 means it continues
- * on later days; startsToday false means not even one request fits in today's allowance.
+ * Roughly how long sorting these songs takes and how much of the daily allowance it needs:
+ * { tokens, minutes, days, todayShare, startsToday }. days > 1 means it continues on later
+ * days; startsToday false means not even one request fits in today's allowance.
  */
-export function estimateArtistJob(groq, artists, batchSize = ARTIST_BATCH) {
+export function estimateSongJob(groq, songs, nodes, batchSize = SONG_BATCH) {
   const mode = modeFor(groq.model);
-  // Reasoning models also think a little per request (asked for low effort: ~a few hundred tokens).
-  const perBatch = estimateTokens(`${ARTIST_TASK}\n${FORMAT.artist[mode]}`) + 40 + (isReasoningModel(groq.model) ? 300 : 0);
-  const tokens = artists.reduce((n, a) => n + estimateTokens(artistLine(a)) + 3 + TYPICAL.artist[mode], 0)
-    + Math.ceil(artists.length / batchSize) * perBatch;
+  const reasoning = isReasoningModel(groq.model);
+  const perBatch = estimateTokens(`${sortingTask(nodes)}\n${FORMAT[mode]}`) + 40 + (reasoning ? 300 : 0);
+  const tokens = songs.reduce((n, s) => n + estimateTokens(songLine(s)) + 3 + TYPICAL[mode], 0)
+    + Math.ceil(songs.length / batchSize) * perBatch;
   const { tpm, tpd, dayLeft } = groq.budget();
-  const smallestRequest = perBatch + 5 * (ROOM.artist[mode] + 12) + (isReasoningModel(groq.model) ? REASONING_ROOM : 0);
-  if (artists.length && dayLeft < smallestRequest) return { tokens, minutes: 0, days: 1 + Math.ceil(tokens / tpd), todayShare: 0, startsToday: false };
+  const smallestRequest = perBatch + 5 * (ROOM[mode] + 20) + (reasoning ? REASONING_ROOM : 0);
+  if (songs.length && dayLeft < smallestRequest) {
+    return { tokens, minutes: 0, days: 1 + Math.ceil(tokens / tpd), todayShare: 0, startsToday: false };
+  }
   const today = Math.min(tokens, dayLeft);
   const days = tokens <= dayLeft ? 1 : 1 + Math.ceil((tokens - dayLeft) / tpd);
-  // Pacing allows `tpm` tokens a minute; replies take time too, so add a little.
-  const minutes = Math.ceil((today / tpm) * 1.15 + 0.5);
+  // Pacing allows `tpm` tokens a minute; each request also reserves reply room, so add some.
+  const minutes = Math.ceil((today / tpm) * 1.4 + 0.5);
   return { tokens, minutes, days, todayShare: tokens ? today / tokens : 1, startsToday: true };
 }
 
-const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
-const NOT_A_TAG = /^(unknown|none|n\/a|na|-+|\?+|empty|no tags?)$/i;
-
-const cleanTags = (list) => list
-  .map((t) => String(t).replace(/["'`*[\]{}()]/g, "").trim().toLowerCase())
-  .filter((t) => t && !NOT_A_TAG.test(t))
-  .map((t) => t.slice(0, 40))
-  .slice(0, 3);
-
 /**
- * Reads a structured reply ({"results":[{"n":1,"tags":[...],"mixed":false}]}) into
- * Map("n" -> { tags, mixed }). If the reply was cut off, every complete answer in it is
- * still picked out. Numbers outside 1..count are ignored; the first answer for a number wins.
+ * Sorts songs not yet in `cache` (song uri -> playlist id or "none"), mutating it, in the
+ * order given. `songs` is [{ uri, title, artist, featured, context }] (context: optional
+ * listener tags for the artist). Throws GroqDailyLimitError when the allowance runs out,
+ * with everything sorted so far already in `cache`.
  */
-export function parseStructuredReply(text, count) {
-  const out = new Map();
-  const add = (n, tags, mixed) => {
-    const k = String(n);
-    if (Number.isInteger(+n) && +n >= 1 && +n <= count && !out.has(k) && Array.isArray(tags)) {
-      out.set(k, { tags: cleanTags(tags), mixed: mixed === true });
-    }
-  };
-  try {
-    const data = JSON.parse(text);
-    for (const r of Array.isArray(data?.results) ? data.results : []) add(r?.n, r?.tags, r?.mixed);
-    return out;
-  } catch { /* cut off or otherwise incomplete: pick out the complete answers below */ }
-  const one = /\{\s*"n"\s*:\s*(\d+)\s*,\s*"tags"\s*:\s*(\[[^\]]*\])\s*(?:,\s*"mixed"\s*:\s*(true|false)\s*)?\}/g;
-  for (const m of text.matchAll(one)) {
-    try { add(+m[1], JSON.parse(m[2]), m[3] === "true"); } catch { /* a half-written answer */ }
-  }
-  return out;
+export async function classifySongs(groq, songs, nodes, cache, { batchSize = SONG_BATCH, onProgress = () => {}, onSaved = () => {} } = {}) {
+  const todo = songs.filter((s) => !(s.uri in cache));
+  const read = answerReader(nodes);
+  let done = 0;
+  onProgress(0, todo.length);
+  await runBatches(groq, todo, {
+    spec: {
+      task: sortingTask(nodes), format: FORMAT, room: ROOM, schema: answerSchema(nodes),
+      parseJson: read.json, parseLines: read.lines,
+    },
+    batchSize, key: (s) => s.uri, line: songLine,
+    onBatch: (results) => {
+      Object.assign(cache, results);
+      done += Object.keys(results).length;
+      onSaved(cache);
+      onProgress(done, todo.length);
+    },
+  });
+  return cache;
 }
 
 /**
- * Whether an unnumbered line reads like genre tags ("pop rock, hip hop | mixed") rather
- * than chatter ("I'm sorry, I can't help with that."). Only tag-like lines are matched up
- * to items by position.
- */
-function looksLikeTags(line) {
-  if (/[?!]|\b(sorry|cannot|can't|unable|here (are|is)|sure|apolog|unfortunately|i am|i'm|as an)\b/i.test(line)) return false;
-  if (/\.\s*$/.test(line.trim())) return false; // ends like a sentence
-  const [answer] = line.split("|");
-  return answer.split(/[,;]/).every((t) => t.trim().split(/\s+/).length <= 4 && t.trim().length <= 40);
-}
-
-function lineAnswer(rest) {
-  let [answer, flags = ""] = rest.split("|");
-  if (answer.includes(":")) answer = answer.slice(answer.lastIndexOf(":") + 1); // "Name: tags"
-  return { tags: cleanTags(answer.split(/[,;]/)), mixed: /mixed/i.test(flags) };
-}
-
-/**
- * Reads "N: tag, tag | mixed" lines into Map("N" -> { tags, mixed }). Tolerant of small
- * drift ("1." or "1)", quotes, brackets, the name echoed back as "1: Name: tags", chatter
- * around the answers). If the model left the numbers off, its lines are only used when
- * there's no doubt which answer is whose: exactly one line per item in a batch of at most
- * 5 (any larger and a skipped line could shift every answer onto the wrong artist).
- * A cut-off reply's half-written last line is ignored. Lines it can't read are simply
- * missing, so they get asked again.
- */
-export function parseReplyLines(text, count = Infinity, cutOff = false) {
-  let lines = text.split(/\r?\n/);
-  if (cutOff) lines = lines.slice(0, -1);
-  const out = new Map();
-  for (const raw of lines) {
-    const m = /^\s*[*-]?\s*\**(\d+)\**\s*[:.)\]–-]\s*(.*)$/.exec(raw);
-    if (m && +m[1] >= 1 && +m[1] <= count && !out.has(m[1])) out.set(m[1], lineAnswer(m[2]));
-  }
-  if (out.size || count > 5) return out;
-  const plain = lines.map((l) => l.replace(/^\s*[*-]\s*/, "").trim()).filter((l) => l && !/^```/.test(l));
-  if (plain.length === count && plain.every(looksLikeTags)) plain.forEach((l, i) => out.set(String(i + 1), lineAnswer(l)));
-  return out;
-}
-
-/**
- * Runs `items` through the model in batches. `onBatch(results)` gets { key: { tags, mixed } }
- * for every item the model actually answered; an empty answer means "unknown".
+ * Runs `items` through the model in batches. `onBatch(results)` gets { key: answer } for
+ * every item the model actually answered (for songs: a playlist id, or "none").
  *
  * Items the model didn't answer are never saved: they're asked again (up to twice) and
  * otherwise left for the next run, so a reply the app couldn't read can't turn into a
- * permanent "unknown". A batch is split in half when Groq refuses it or its reply can't be
+ * permanent "none". A batch is split in half when Groq refuses it or its reply can't be
  * read (retrying it unchanged is pointless: with temperature 0 the model says the same
  * again), which narrows a problem down to the item causing it.
  *
@@ -519,148 +503,4 @@ async function runBatches(groq, items, { spec, line, key, batchSize, onBatch }) 
   }
 
   for (let i = 0; i < items.length; i += batchSize) await attempt(items.slice(i, i + batchSize));
-}
-
-const tagSpec = (kind) => ({
-  task: kind === "artist" ? ARTIST_TASK : SONG_TASK,
-  format: FORMAT[kind], room: ROOM[kind], schema: SCHEMA[kind],
-  parseJson: parseStructuredReply, parseLines: parseReplyLines,
-});
-
-const artistLine = (a) => `${clip(a.name, 60)}${a.titles.length ? ` (songs: ${a.titles.map((t) => clip(t, 35)).join("; ")})` : ""}`;
-
-/**
- * Tags artists not yet in `cache` (artist id -> { tags, mixed }), mutating it.
- * `artists` is [{ id, name, titles, songCount }]; artists with the most liked songs go
- * first, so if the daily allowance runs out, the most music is already sorted.
- */
-export async function tagArtists(groq, artists, cache, { batchSize = ARTIST_BATCH, onProgress = () => {}, onSaved = () => {} } = {}) {
-  const todo = artists.filter((a) => !(a.id in cache)).sort((a, b) => b.songCount - a.songCount);
-  let done = 0;
-  onProgress(0, todo.length);
-  await runBatches(groq, todo, {
-    spec: tagSpec("artist"), batchSize, key: (a) => a.id, line: artistLine,
-    onBatch: (results) => {
-      Object.assign(cache, results);
-      done += Object.keys(results).length;
-      onSaved(cache);
-      onProgress(done, todo.length);
-    },
-  });
-  return cache;
-}
-
-/** Tags songs not yet in `cache` (song uri -> { tags }), mutating it. `songs` is [{ uri, title, artist }]. */
-export async function tagSongs(groq, songs, cache, { batchSize = SONG_BATCH, onProgress = () => {}, onSaved = () => {} } = {}) {
-  const todo = songs.filter((s) => !(s.uri in cache));
-  let done = 0;
-  onProgress(0, todo.length);
-  await runBatches(groq, todo, {
-    spec: tagSpec("song"), batchSize, key: (s) => s.uri,
-    line: (s) => `"${clip(s.title, 60)}" by ${clip(s.artist, 40)}`,
-    onBatch: (results) => {
-      for (const [k, v] of Object.entries(results)) cache[k] = { tags: v.tags };
-      done += Object.keys(results).length;
-      onSaved(cache);
-      onProgress(done, todo.length);
-    },
-  });
-  return cache;
-}
-
-// --------------------------------------------------------------------------- playlist picks
-
-/**
- * Second pass for artists whose tags didn't match any playlist (or who had none): the
- * model picks the playlist that fits best from the actual list, using everything known
- * about the artist. In strict mode the answer can only be one of the playlist ids or
- * "none", so it can't invent a category. "none" is saved too (the artist stays in
- * Uncategorized); unanswered artists aren't saved and are asked again next run.
- */
-function pickSpec(buckets) {
-  const ids = buckets.map((b) => b.id);
-  const byName = new Map(buckets.flatMap((b) => [[b.id, b.id], [b.name.toLowerCase(), b.id]]));
-  const valid = (v) => (v === "none" ? "none" : byName.get(String(v || "").trim().toLowerCase()) || null);
-  const parseJson = (text, count) => {
-    const out = new Map();
-    const add = (n, pick) => {
-      const k = String(n);
-      const v = valid(pick);
-      if (v && Number.isInteger(+n) && +n >= 1 && +n <= count && !out.has(k)) out.set(k, { playlist: v });
-    };
-    try {
-      const data = JSON.parse(text);
-      for (const r of Array.isArray(data?.results) ? data.results : []) add(r?.n, r?.playlist);
-      return out;
-    } catch { /* cut off: pick out the complete answers */ }
-    for (const m of text.matchAll(/\{\s*"n"\s*:\s*(\d+)\s*,\s*"playlist"\s*:\s*"([^"]*)"\s*\}/g)) add(+m[1], m[2]);
-    return out;
-  };
-  const parseLines = (text, count, cutOff) => {
-    let lines = text.split(/\r?\n/);
-    if (cutOff) lines = lines.slice(0, -1);
-    const out = new Map();
-    for (const raw of lines) {
-      const m = /^\s*[*-]?\s*\**(\d+)\**\s*[:.)\]–-]\s*["'`*]*([^"'`*|]*)/.exec(raw);
-      const v = m && valid(m[2]);
-      if (v && +m[1] >= 1 && +m[1] <= count && !out.has(m[1])) out.set(m[1], { playlist: v });
-    }
-    return out;
-  };
-  return {
-    task: `You sort music artists into playlists. For each numbered artist, pick the one playlist their music fits best, from this list (answer with the id):
-${buckets.map((b) => `${b.id}: ${b.name}`).join("\n")}
-Use everything given: genre tags (from you or from Last.fm listeners), the artists they work with, and their song titles. Answer "none" only if there's no reasonable basis to place the artist at all; never pick from the artist's name alone.`,
-    format: {
-      json: "Give exactly one result per numbered artist, with its number n.",
-      lines: "Reply with exactly one line per artist, starting with its number, and nothing else, e.g.\n1: hip-hop-rap\n2: none",
-    },
-    room: { json: 16, lines: 10 },
-    schema: {
-      type: "object",
-      properties: {
-        results: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: { n: { type: "integer" }, playlist: { type: "string", enum: [...ids, "none"] } },
-            required: ["n", "playlist"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["results"],
-      additionalProperties: false,
-    },
-    parseJson, parseLines,
-  };
-}
-
-const pickLine = (a) => {
-  const parts = [];
-  if (a.tags?.length) parts.push(`tags: ${a.tags.join(", ")}`);
-  if (a.lastfm?.length) parts.push(`Last.fm: ${a.lastfm.join(", ")}`);
-  if (a.featured?.length) parts.push(`works with: ${a.featured.map((f) => clip(f, 30)).join(", ")}`);
-  if (a.titles?.length) parts.push(`songs: ${a.titles.map((t) => clip(t, 35)).join("; ")}`);
-  return `${clip(a.name, 60)}${parts.length ? ` (${parts.join("; ")})` : ""}`;
-};
-
-/**
- * Picks playlists for artists not yet in `cache` (artist id -> playlist id or "none"),
- * mutating it. `artists` is [{ id, name, tags, lastfm, featured, titles, songCount }].
- */
-export async function pickPlaylists(groq, artists, buckets, cache, { batchSize = 50, onProgress = () => {}, onSaved = () => {} } = {}) {
-  const todo = artists.filter((a) => !(a.id in cache)).sort((a, b) => b.songCount - a.songCount);
-  let done = 0;
-  onProgress(0, todo.length);
-  await runBatches(groq, todo, {
-    spec: pickSpec(buckets), batchSize, key: (a) => a.id, line: pickLine,
-    onBatch: (results) => {
-      for (const [k, v] of Object.entries(results)) cache[k] = v.playlist;
-      done += Object.keys(results).length;
-      onSaved(cache);
-      onProgress(done, todo.length);
-    },
-  });
-  return cache;
 }

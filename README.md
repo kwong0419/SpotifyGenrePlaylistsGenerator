@@ -16,34 +16,39 @@ The first visit walks you through two one-time steps, about 5 minutes in total:
 2. **A Groq API key** (free, no credit card) from [console.groq.com/keys](https://console.groq.com/keys).
 
 After that it's *Log in with Spotify → preview your genres → Create playlists*. Before a long sort the
-page shows how many artists there are, roughly how long it will take and whether it needs more than
+page shows how many songs there are, roughly how long it will take and whether it needs more than
 one day of Groq's free allowance. While it runs, the tab's title shows the progress and turns into ✓
 when it's done.
 
-## How genres are worked out
-
-Spotify only lets a development app look up a few hundred artists before it blocks the whole developer
-account for about a day. So instead of asking Spotify for each artist's genres, the app:
+## How songs are sorted
 
 1. Reads your Liked Songs from Spotify (50 per request; skipped if nothing changed since last time).
-2. Sends your artists' names, with a couple of song titles each, to **Groq** (a free AI service),
-   about 80 per request. The model tags each artist the way Spotify would ("chicago drill",
-   "bedroom pop"), or says it doesn't know rather than guessing.
-3. For artists whose songs span different genres (say, hip hop and rock), it tags each of their
-   songs separately, so the songs can land in different playlists.
-4. Runs the tags through the keyword rules in [`docs/genres.json`](docs/genres.json) to pick one of
-   24 playlists per song. Optionally, Last.fm fills in artists the model didn't know.
-5. For artists whose tags still fit no playlist, a second pass asks the model to pick the best
-   playlist from the actual list, using everything known (tags, Last.fm tags, who they work with,
-   their songs). The answer can only be a real playlist or "none", and artists with no basis to
-   place them stay in **Uncategorized** rather than being guessed. The preview says why songs are
-   left there, and **Ask again** on that row re-sorts just those artists.
+2. Sends your songs to **Groq** (a free AI service), about 90 per request, as "title by artist" (plus
+   featured artists). The model judges **each song on its own** and picks the most specific playlist
+   it fits from [`docs/taxonomy.json`](docs/taxonomy.json): 26 genres with subgenres, like
+   *Electronic & Dance → Deep House, Techno, Dubstep…*, *Hip-Hop & Rap → Trap, Drill, Melodic Rap…*,
+   and K-Pop and J-Pop as separate playlists. It answers "none" when it doesn't know a song, rather
+   than guessing.
+3. **A subgenre becomes its own playlist once it has 15 songs** (or already has a playlist from an
+   earlier run, so playlists don't flip between runs). Otherwise its songs go into the broad genre's
+   playlist, so a library with three techno songs gets them in *Electronic & Dance*, not a tiny playlist.
+4. Optionally, songs the model couldn't place are asked again with Last.fm's listener tags for their
+   artist.
 
 Groq replies use [strict structured outputs](https://console.groq.com/docs/structured-outputs) where
-the model supports them, so the reply format can't drift; other models answer in numbered lines.
+the model supports them, so the answer can only be a real playlist from the list; other models answer
+in numbered lines, and anything that isn't a real playlist is ignored and asked again.
 
-Results are saved in your browser, so later runs only send newly liked artists. A 7,400-song
-library takes about 350 Spotify requests on the first run and only a handful after that.
+Answers are saved in your browser, so later runs only send newly liked songs. Sorting a 7,000-song
+library the first time takes about two days of Groq's free allowance; you can make playlists from
+what's sorted on day one.
+
+### Check the accuracy first
+
+[`accuracy.html`](https://kwong0419.github.io/SpotifyGenrePlaylistsGenerator/accuracy.html) sorts
+about 120 well-known songs with known genres ([`docs/benchmark.json`](docs/benchmark.json)) using
+your Groq key, exactly like the real run, and shows how many land in the right playlist and which
+don't. It uses a few thousand tokens.
 
 ## Staying within the free limits
 
@@ -52,7 +57,7 @@ library takes about 350 Spotify requests on the first run and only a handful aft
   come back. Playlists that haven't changed aren't rewritten.
 - **Groq:** every request is budgeted against the free tier before it's sent, using at most 80% of the
   per-minute limit and 90% of the daily limit, tracked across reloads and tabs. If a big library needs
-  more than a day's allowance, the artists with the most songs go first. You can make playlists right
+  more than a day's allowance, the most recently liked songs go first. You can make playlists right
   away with what's sorted, and the rest is added to the same playlists on a later run.
 - Only one run at a time, even across tabs.
 
@@ -67,10 +72,11 @@ library takes about 350 Spotify requests on the first run and only a handful aft
   if anything went wrong on the way); it's rewritten if it isn't exactly right.
   Each song goes into exactly one genre, and the same song liked from two releases (single vs. album,
   remaster) is included once.
-- **No song in two playlists.** A song can move genre on a later run (for example when a big library
-  finishes sorting on day 2), so every genre playlist the app has made is kept up to date on each run,
-  ticked or not, and emptied if all its songs moved elsewhere. To stop a playlist being updated,
-  delete it in Spotify.
+- **No song in two playlists.** A song can move playlist on a later run (for example when a subgenre
+  reaches 15 songs, or a big library finishes sorting on day 2), so every playlist the app has made is
+  kept up to date on each run, ticked or not, and emptied if all its songs moved elsewhere. Playlists
+  for genres that were removed or split are emptied too. To stop a playlist being updated, delete it
+  in Spotify.
 - Only one run at a time: the button locks, and a second browser tab is refused.
 
 ## Hosting your own copy (one time, about 10 minutes)
@@ -114,6 +120,7 @@ Then open `http://127.0.0.1:8765/docs/` (add that exact address as a Redirect UR
 
 To try the whole flow **without any accounts**, open `http://127.0.0.1:8765/tests/demo.html`.
 It runs the real app against a simulated Spotify and Groq; any Groq key works there.
+`tests/accuracy-demo.html` does the same for the accuracy check.
 
 ## Tests
 
@@ -125,12 +132,13 @@ They simulate Spotify and Groq misbehaving (a slow-to-update playlist list, requ
 report an error, rate limits, used-up quotas, broken AI replies) and check that no duplicate playlists
 or songs are ever created and that neither service is pushed past its limits.
 
-## Customizing genres
+## Customizing playlists
 
-Each genre in `docs/genres.json` has an `id`, a display `name` and `keywords`. A genre tag goes to
-the **first** genre with a keyword inside it, so specific genres go above broad ones (`K-Pop` above `Pop`).
-A song goes where most of its tags point; a tie goes to the tag listed first. You can rename a genre
-freely, but changing its `id` makes a new playlist. Changing the rules doesn't use any Groq allowance.
+[`docs/taxonomy.json`](docs/taxonomy.json) lists the playlists: each genre has an `id`, a `name`, a
+`hint` telling the model what belongs there, and optional `sub`genres. You can rename freely, but
+changing an `id` makes a new playlist. When the list changes, songs are sorted again, and playlists
+for genres no longer in the list are emptied (so no song is in two playlists) and listed so you can
+delete them.
 
 ## License
 

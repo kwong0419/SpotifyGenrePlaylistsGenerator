@@ -1,14 +1,20 @@
-// An in-memory Groq that knows a fixed set of artists and songs, counts tokens, and can
-// misbehave on purpose: per-minute and per-day 429s, garbled or partial replies, answers
-// without numbers, skipped answers, strict mode turned down, bad keys.
+// An in-memory Groq that sorts songs into playlists the way the real model is asked to,
+// counts tokens, and can misbehave on purpose: per-minute and per-day 429s, garbled or
+// partial replies, answers without numbers, invented playlists, strict mode turned down,
+// bad keys, reasoning models that think before answering.
 // Like the real API, a request with a strict json_schema response_format gets a JSON reply
 // in exactly that shape; otherwise the model answers in lines.
 // Used by the Node tests and by tests/demo.html.
 
 export class FakeGroq {
-  constructor({ artists = {}, songs = {}, models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-120b"] } = {}) {
-    this.artists = artists;      // name -> { tags, mixed }
-    this.songs = songs;          // title -> tags
+  /**
+   * songs: "Title by Artist" (or just "Title") -> playlist id (the model knows that song)
+   * artists: artist name -> playlist id (used for that artist's other songs)
+   * Anything else is answered "none".
+   */
+  constructor({ songs = {}, artists = {}, models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-120b"] } = {}) {
+    this.songs = songs;
+    this.artists = artists;
     this.models = models;
     this.key = null;             // if set, any other key is rejected
     this.tokensUsed = 0;
@@ -16,22 +22,37 @@ export class FakeGroq {
     this.dailyLimit = Infinity;  // tokens; going past it gives a per-day 429
     this.minuteLimitNext = 0;    // next N completions get a per-minute 429
     this.garbleNext = 0;         // next N completions reply with prose instead of answers
-    this.preamble = "";          // text the model adds before its answers
+    this.preamble = "";          // text the model adds before its answers (line format)
     this.dropEvery = 0;          // leave out every Nth item from replies
+    this.skip = null;            // Set of song titles the model never answers
     this.jsonFailNext = 0;       // next N completions: Groq's 400 json_validate_failed
-    this.poison = null;          // any batch containing this name gets an unusable reply
+    this.poison = null;          // any batch containing this text gets an unusable reply
     this.unnumbered = false;     // line replies leave out the "N:" numbers
-    this.omitBlank = false;      // line replies skip the lines for unknown items
+    this.invent = null;          // a playlist the model makes up (line format) for every answer
     this.noSchema = false;       // turn down strict structured output (400)
+    this.fromTags = null;        // (listener tags) -> playlist id, when only tags are known
     this.structuredRequests = 0;
-    this.picks = {};             // artist name -> playlist id, for "pick a playlist" requests
-    this.pickRequests = 0;
-    this.calls = [];             // number of items in each completion request
+    this.calls = [];             // number of songs in each completion request
+    this.seen = [];              // every song line sent
   }
+
   reply(status, body) {
     return { ok: status < 400, status, headers: { get: () => null }, text: async () => JSON.stringify(body) };
   }
-  fetch = async (url, { method, headers, body }) => {
+
+  answerFor(line) {
+    const m = /^\d+\. "(.*)" by (.*?)(?: \((.*)\))?$/.exec(line);
+    if (!m) return "none";
+    const [, title, artist, extra = ""] = m;
+    if (`${title} by ${artist}` in this.songs) return this.songs[`${title} by ${artist}`];
+    if (title in this.songs) return this.songs[title];
+    if (artist in this.artists) return this.artists[artist];
+    const tags = /listener tags for the artist: ([^;)]*)/.exec(extra)?.[1];
+    if (tags && this.fromTags) return this.fromTags(tags);
+    return "none";
+  }
+
+  fetch = async (url, { headers, body }) => {
     if (this.key && headers.Authorization !== `Bearer ${this.key}`) {
       return this.reply(401, { error: { message: "Invalid API Key", code: "invalid_api_key" } });
     }
@@ -49,11 +70,17 @@ export class FakeGroq {
       this.minuteLimitNext--;
       return this.reply(429, { error: { message: `Rate limit reached for model \`${req.model}\` on tokens per minute (TPM): Limit 12000. Please try again in 2.5s.`, type: "tokens" } });
     }
+    const structured = req.response_format?.type === "json_schema";
+    if (structured && this.noSchema) {
+      this.tokensUsed += promptTokens;
+      return this.reply(400, { error: { message: "response_format `json_schema` is not supported with this model", type: "invalid_request_error" } });
+    }
     this.requests++;
+    if (structured) this.structuredRequests++;
     const lines = req.messages[1].content.split("\n");
     this.calls.push(lines.length);
-    const poisoned = this.poison && lines.some((l) => l.includes(this.poison));
-    if (this.jsonFailNext-- > 0) { // Groq's JSON-mode refusal, kept to prove it's still handled
+    this.seen.push(...lines);
+    if (this.jsonFailNext-- > 0) {
       this.tokensUsed += promptTokens;
       this.jsonFailures = (this.jsonFailures || 0) + 1;
       return this.reply(400, { error: {
@@ -61,56 +88,30 @@ export class FakeGroq {
         type: "invalid_request_error", code: "json_validate_failed",
       } });
     }
-    const structured = req.response_format?.type === "json_schema";
-    if (structured && this.noSchema) {
-      this.tokensUsed += promptTokens;
-      return this.reply(400, { error: {
-        message: "response_format `json_schema` is not supported with this model", type: "invalid_request_error",
-      } });
-    }
-    if (structured) this.structuredRequests++;
-
-    // "Pick a playlist" requests (the second pass for artists still uncategorized).
-    if (req.messages[0].content.startsWith("You sort music artists into playlists")) {
-      this.pickRequests++;
-      const picks = lines.map((line, i) => {
-        const name = /^\d+\. (.*?)(?: \(.*\))?$/.exec(line)[1];
-        return { n: i + 1, playlist: this.picks[name] || "none" };
-      });
-      const content = structured ? JSON.stringify({ results: picks }) : picks.map((p) => `${p.n}: ${p.playlist}`).join("\n");
-      const completionTokens = Math.ceil(content.length / 3.5);
-      this.tokensUsed += promptTokens + completionTokens;
-      return this.reply(200, {
-        choices: [{ message: { content }, finish_reason: "stop" }],
-        usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
-      });
-    }
+    const poisoned = this.poison && lines.some((l) => l.includes(this.poison));
 
     const answers = [];
     lines.forEach((line, i) => {
       const n = i + 1;
       if (this.dropEvery && n % this.dropEvery === 0) return;
-      if (this.skip && [...this.skip].some((name) => line.includes(`${name} (`) || line.endsWith(name))) return;
-      const song = /^\d+\. "(.*)" by (.*)$/.exec(line);
-      if (song) { answers.push({ n, tags: this.songs[song[1]] || [], song: true }); return; }
-      const name = /^\d+\. (.*?)(?: \(songs: .*\))?$/.exec(line)[1];
-      const known = this.artists[name];
-      answers.push({ n, tags: known?.tags || [], mixed: !!known?.mixed });
+      if (this.skip && [...this.skip].some((t) => line.includes(`"${t}"`))) return;
+      answers.push({ n, playlist: this.answerFor(line) });
     });
 
     let content;
     if (structured) {
-      // Constrained decoding: always this exact shape, whatever else is going on.
+      // Constrained decoding: always this exact shape, and only ids from the schema's enum.
+      const allowed = new Set(req.response_format.json_schema.schema.properties.results.items.properties.playlist.enum);
       const results = poisoned || this.garbleNext-- > 0 ? []
-        : answers.map((a) => (a.song ? { n: a.n, tags: a.tags } : { n: a.n, tags: a.tags, mixed: a.mixed }));
-      content = JSON.stringify({ results });
+        : answers.map((a) => ({ n: a.n, playlist: allowed.has(a.playlist) ? a.playlist : "none" }));
+      content = JSON.stringify({ results }, null, 2); // spaced out, like gpt-oss
     } else {
       content = (this.preamble || "") + answers
-        .filter((a) => !(this.omitBlank && !a.tags.length))
-        .map((a) => `${this.unnumbered ? "" : `${a.n}: `}${a.tags.join(", ")}${a.mixed ? " | mixed" : ""}`)
+        .map((a) => `${this.unnumbered ? "" : `${a.n}: `}${this.invent || a.playlist}`)
         .join("\n");
       if (this.garbleNext-- > 0 || poisoned) content = "I'm sorry, I can't help with that list.";
     }
+
     // Like gpt-oss on Groq: reasoning models think first, and the thinking uses up
     // max_tokens before any answer is written (less with reasoning_effort "low").
     const thinking = /gpt-oss/.test(req.model) ? (req.reasoning_effort === "low" ? 200 : 900) : 0;
@@ -131,28 +132,29 @@ export class FakeGroq {
   };
 }
 
-/** Groq's view of the demo library's artists (see demoLibrary in fake-spotify.mjs). */
+/** How the simulated model sorts the demo library (see demoLibrary in fake-spotify.mjs). */
 export function demoGroq() {
-  const groq = new FakeGroq({
+  return new FakeGroq({
     artists: {
-      "Kendrick Lamar": { tags: ["conscious hip hop", "west coast rap"] },
-      "Phoebe Bridgers": { tags: ["indie pop", "la indie"] },
-      "Bad Bunny": { tags: ["reggaeton", "trap latino"] },
-      "Taylor Swift": { tags: ["pop", "country pop"], mixed: true },
-      "Fred again..": { tags: ["stutter house", "edm"] },
-      "SZA": { tags: ["r&b", "pop"] },
-      "Arctic Monkeys": { tags: ["garage rock", "modern rock"] },
-      "Zach Bryan": { tags: ["classic oklahoma country"] },
-      "NewJeans": { tags: ["k-pop girl group"] },
-      "Burna Boy": { tags: ["afrobeats", "nigerian pop"] },
-      "Bill Evans": { tags: ["cool jazz", "jazz piano"] },
+      "Kendrick Lamar": "conscious-rap",
+      "Phoebe Bridgers": "indie-pop",
+      "Bad Bunny": "reggaeton",
+      "Taylor Swift": "pop",
+      "Fred again..": "house",
+      "SZA": "contemporary-rnb",
+      "Arctic Monkeys": "indie-rock",
+      "Zach Bryan": "modern-country",
+      "NewJeans": "k-pop",
+      "Burna Boy": "afrobeats",
+      "Bill Evans": "jazz",
+      "Clifton Chenier": "folk-acoustic",
       // "Small Local Band" is unknown to the model on purpose.
-      "Clifton Chenier": { tags: ["zydeco", "cajun"] }, // genres no playlist's keywords cover
     },
-    // Taylor Swift's early songs are country, the rest pop.
-    songs: { Midnight: ["contemporary country"], "Golden Hour": ["contemporary country"], "Paper Planes": ["country pop"] },
+    // Some of Taylor Swift's songs are country, one is a ballad.
+    songs: {
+      "Midnight by Taylor Swift": "modern-country",
+      "Golden Hour by Taylor Swift": "modern-country",
+      "Paper Planes by Taylor Swift": "pop-ballads",
+    },
   });
-  // The second pass: asked to pick a playlist, the model places zydeco under Folk.
-  groq.picks = { "Clifton Chenier": "folk-acoustic" };
-  return groq;
 }

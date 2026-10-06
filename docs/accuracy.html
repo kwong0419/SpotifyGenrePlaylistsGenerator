@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Accuracy Check — Genre Sorter</title>
+  <meta name="description" content="Measure how accurately Groq sorts well-known songs before sorting your whole library.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="accuracy.js"></script>
+</head>
+<body>
+  <header class="top">
+    <span class="brand">🎧 Genre Sorter</span>
+    <a class="small" href="./">Back to the app</a>
+  </header>
+  <main>
+    <section class="card">
+      <h1>Accuracy check</h1>
+      <p class="lead">Before sorting your whole library, this sorts <span id="count">about 120</span> well-known songs whose genres are known, exactly the way the real run does, and shows how many land in the right playlist.</p>
+      <p class="note" id="setup-note">It uses your Groq key and model from the app (<span id="model"></span>) and about <span id="cost"></span> tokens of today's free allowance. Nothing on Spotify is touched.</p>
+      <button class="primary big" id="run">Run the check</button>
+      <p class="error" id="error" hidden></p>
+    </section>
+
+    <section class="card" id="progress-card" hidden>
+      <h2 id="progress-title">Sorting…</h2>
+      <div class="bar"><div id="progress-fill"></div></div>
+      <p class="small muted" id="progress-text"></p>
+    </section>
+
+    <section id="results" hidden>
+      <div class="card">
+        <h2>Results</h2>
+        <div class="stats">
+          <div><span class="stat" id="exact"></span><span class="small muted">right playlist</span></div>
+          <div><span class="stat" id="family"></span><span class="small muted">right genre, different subgenre</span></div>
+          <div><span class="stat" id="wrong"></span><span class="small muted">wrong genre</span></div>
+        </div>
+        <p id="verdict"></p>
+        <p class="small muted" id="unknown"></p>
+      </div>
+      <div class="card">
+        <h2>Songs that didn't land in an expected playlist</h2>
+        <p class="small muted">"Expected" lists every playlist that counts as right for the song.</p>
+        <ul class="genres" id="misses"></ul>
+      </div>
+    </section>
+  </main>
+  <footer class="small muted">Not affiliated with Spotify. Runs entirely in your browser.</footer>
+</body>
+</html>

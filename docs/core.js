@@ -200,41 +200,56 @@ export async function fetchLikedTracks(api, onProgress = () => {}, saved = null)
 
 // --------------------------------------------------------------------------- sorting
 
-export function bucketForGenre(genre, buckets) {
-  const g = genre.toLowerCase();
-  return buckets.find((b) => b.keywords.some((k) => g.includes(k.toLowerCase()))) || null;
+/**
+ * The playlist list from taxonomy.json as one flat list, each broad genre followed by its
+ * subgenres: [{ id, name, hint, parent }] where parent is the broad genre's id (or null).
+ */
+export function flattenTaxonomy(genres) {
+  return genres.flatMap((g) => [
+    { id: g.id, name: g.name, hint: g.hint, parent: null },
+    ...(g.sub || []).map((s) => ({ id: s.id, name: s.name, hint: s.hint, parent: g.id })),
+  ]);
+}
+
+export const MIN_SUBGENRE_SONGS = 15;
+
+/**
+ * Groups songs into playlists from the playlist chosen for each song (`picks`: uri ->
+ * playlist id or "none"). A subgenre only becomes its own playlist when it has at least
+ * `minSubgenre` songs, or a playlist for it already exists (`keepIds`), so playlists don't
+ * flip between runs; otherwise its songs go into the broad genre's playlist.
+ * Songs answered "none", or picked into an unknown id, go to Uncategorized; songs for
+ * which `isPending` is true (not sorted yet) to Not sorted yet.
+ * Returns [{ bucket, tracks }] in taxonomy order, then Uncategorized, then Not sorted yet.
+ */
+export function groupSongs(tracks, picks, nodes, { isPending = () => false, keepIds = new Set(), minSubgenre = MIN_SUBGENRE_SONGS } = {}) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const chosen = new Map();
+  const counts = new Map();
+  for (const t of tracks) {
+    const node = isPending(t) ? NOT_SORTED_YET : byId.get(picks[t.uri]) || UNCATEGORIZED;
+    chosen.set(t, node);
+    counts.set(node.id, (counts.get(node.id) || 0) + 1);
+  }
+  const groups = new Map([...nodes, UNCATEGORIZED, NOT_SORTED_YET].map((n) => [n.id, { bucket: n, tracks: [] }]));
+  for (const t of tracks) {
+    let node = chosen.get(t);
+    if (node.parent && (counts.get(node.id) || 0) < minSubgenre && !keepIds.has(node.id)) node = byId.get(node.parent);
+    groups.get(node.id).tracks.push(t);
+  }
+  return [...groups.values()].filter((g) => g.tracks.length);
 }
 
 /**
- * The bucket most of these genre tags map to, or null. A tie goes to the bucket of the
- * earliest tag, since tags are listed most representative first.
+ * How one answer scores: "exact" if it's one of the playlists that count as right, "family"
+ * if it's in the same broad genre as one of them (say Deep House instead of House),
+ * "unknown" for "none", otherwise "wrong".
  */
-export function bucketForTags(tags, buckets) {
-  const votes = new Map(); // insertion order = order of first appearance in the tags
-  for (const g of tags || []) {
-    const b = bucketForGenre(g, buckets);
-    if (b) votes.set(b, (votes.get(b) || 0) + 1);
-  }
-  if (!votes.size) return null;
-  const top = Math.max(...votes.values());
-  return [...votes].find(([, n]) => n === top)[0];
-}
-
-/**
- * The single bucket a track belongs to, from the most specific evidence down:
- *   1. the song's own tags (for artists whose songs span different genres)
- *   2. its main artist's tags, then its featured artists' tags
- *   3. the playlist picked for its main artist in the second pass (`picks`: artist id ->
- *      bucket id), for artists whose tags didn't match any playlist
- */
-export function classifyTrack(track, artistGenres, buckets, songGenres = {}, picks = {}) {
-  const own = bucketForTags(songGenres[track.uri], buckets);
-  if (own) return own;
-  for (const aid of track.artistIds) {
-    const b = bucketForTags(artistGenres[aid], buckets);
-    if (b) return b;
-  }
-  return buckets.find((b) => b.id === picks[track.artistIds[0]]) || UNCATEGORIZED;
+export function scoreAnswer(answer, ok, nodes) {
+  if (ok.includes(answer)) return "exact";
+  if (answer === "none" || answer === undefined) return "unknown";
+  const family = (id) => nodes.find((n) => n.id === id)?.parent || id;
+  return ok.some((id) => family(id) === family(answer)) ? "family" : "wrong";
 }
 
 /** "Song - 2011 Remaster" and "Song (Remastered)" are the same song. */
@@ -267,20 +282,6 @@ export function dedupeTracks(tracks) {
   return { tracks: kept, removed };
 }
 
-/**
- * bucket id -> { bucket, tracks[] } in genres.json order, then Uncategorized, then
- * Not sorted yet (tracks for which `isPending(track)` is true).
- */
-export function groupTracks(tracks, artistGenres, buckets, { songGenres = {}, isPending = () => false, picks = {} } = {}) {
-  const all = [...buckets, UNCATEGORIZED, NOT_SORTED_YET];
-  const groups = new Map(all.map((b) => [b.id, { bucket: b, tracks: [] }]));
-  for (const t of tracks) {
-    const bucket = isPending(t) ? NOT_SORTED_YET : classifyTrack(t, artistGenres, buckets, songGenres, picks);
-    groups.get(bucket.id).tracks.push(t);
-  }
-  return [...groups.values()].filter((g) => g.tracks.length);
-}
-
 // --------------------------------------------------------------------------- playlists
 
 export const tagFor = (bucketId) => `[gs:${bucketId}]`;
@@ -299,6 +300,7 @@ const descriptionFor = (bucket) =>
  * rather than deleting anything.
  *
  * `remembered` is bucket id -> { id, createdAt, snapshot, hash } saved by this browser.
+ * Also returns `retired`: playlists this app made for genres no longer in `buckets`.
  */
 export async function resolvePlaylists(api, userId, buckets, nameFor, remembered = {}, now = Date.now()) {
   const owned = (await getAllPages(api, "/me/playlists?limit=50"))
@@ -330,7 +332,14 @@ export async function resolvePlaylists(api, userId, buckets, nameFor, remembered
       result.set(bucket.id, { playlistId: null, isNew: true });
     }
   }
-  return { targets: result, warnings };
+  // Playlists made for a genre that's no longer in the list (say "K-Pop & J-Pop" after it
+  // was split in two). Their songs now live in other playlists, so they must be emptied.
+  const known = new Set([...buckets.map((b) => b.id), NOT_SORTED_YET.id]);
+  const retired = owned
+    .map((p) => ({ playlist: p, id: /\[gs:([a-z0-9-]+)\]/.exec(p.description || "")?.[1] }))
+    .filter(({ id }) => id && !known.has(id))
+    .map(({ playlist, id }) => ({ bucketId: id, playlistId: playlist.id, name: playlist.name }));
+  return { targets: result, warnings, retired };
 }
 
 async function readPlaylistUris(api, playlistId) {
@@ -429,11 +438,14 @@ export function planSync(groups, targets, selectedIds, buckets) {
  * since (same Spotify version id) is left alone, which keeps re-runs to a few requests.
  */
 export async function syncPlaylists(api, {
-  userId, groups, nameFor, isPublic, remembered, remember, onStep = () => {}, verifyDelayMs,
+  userId, groups, nameFor, isPublic, remembered, remember, onStep = () => {}, verifyDelayMs, knownBuckets,
 }) {
   const buckets = groups.map((g) => g.bucket);
   onStep({ phase: "checking" });
-  const { targets, warnings } = await resolvePlaylists(api, userId, buckets, nameFor, remembered);
+  // Retiring needs the full playlist list (`knownBuckets`): judged against only the genres
+  // being written now, every other playlist would look retired.
+  const { targets, warnings, retired: found } = await resolvePlaylists(api, userId, knownBuckets || buckets, nameFor, remembered);
+  const retired = knownBuckets ? found : [];
   const results = [];
   for (const [i, g] of groups.entries()) {
     const target = targets.get(g.bucket.id);
@@ -466,5 +478,16 @@ export async function syncPlaylists(api, {
     remember(g.bucket.id, { id: playlistId, snapshot, hash });
     results.push({ bucket: g.bucket, playlistId, count: g.tracks.length, isNew: target.isNew });
   }
-  return { results, warnings };
+  // Retired playlists are emptied (once; already-empty ones are left alone) so none of
+  // their songs is also in its new playlist. Deleting them is left to the user.
+  for (const r of retired) {
+    const count = await readPlaylistCount(api, r.playlistId);
+    if (count !== 0) {
+      await api.request("PUT", `/playlists/${r.playlistId}`, {
+        description: `No longer used by Genre Sorter: its songs moved to other playlists. Safe to delete. ${tagFor(r.bucketId)}`,
+      });
+      await writePlaylist(api, r.playlistId, [], { verifyDelayMs });
+    }
+  }
+  return { results, warnings, retired };
 }

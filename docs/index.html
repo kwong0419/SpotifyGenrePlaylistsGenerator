@@ -84,12 +84,13 @@
       <h1>Before we start</h1>
       <p class="lead" id="plan-lead"></p>
       <div class="stats">
-        <div><span class="stat" id="plan-artists"></span><span class="small muted">artists to sort</span></div>
+        <div><span class="stat" id="plan-artists"></span><span class="small muted">songs to sort</span></div>
         <div><span class="stat" id="plan-time"></span><span class="small muted" id="plan-time-label">estimated time</span></div>
         <div><span class="stat" id="plan-days"></span><span class="small muted">of Groq's free allowance</span></div>
       </div>
       <p class="note" id="plan-note"></p>
       <button class="primary big" id="plan-start">Start sorting</button>
+      <p class="small muted">Want to see how accurate it is first? <a href="accuracy.html" target="_blank" rel="noopener">Run the accuracy check</a> on about 120 well-known songs (a few thousand tokens).</p>
     </section>
 
     <!-- Preview -->
@@ -209,7 +210,8 @@
       <p class="small muted" id="app-source"></p>
       <div class="row wrap">
         <button type="button" class="secondary" data-go="setup" id="change-app">Use a different Spotify app</button>
-        <button type="button" class="secondary" id="refresh-genres">Sort all artists again</button>
+        <button type="button" class="secondary" id="refresh-genres">Sort all songs again</button>
+        <a class="secondary-link" href="accuracy.html" target="_blank" rel="noopener">Accuracy check</a>
         <button type="button" class="secondary danger" id="logout">Log out</button>
       </div>
       <div class="row end"><button class="primary" value="close">Save</button></div>
