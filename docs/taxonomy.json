@@ -1,0 +1,76 @@
+{
+  "_comment": "The playlists songs can be sorted into, in two levels. Each song is placed in the most specific entry that fits; a subgenre only becomes its own playlist once it has enough songs (or already exists), otherwise its songs go into the parent. 'id' is how a playlist is recognised on later runs: rename freely, but changing an id makes a new playlist. 'hint' tells the model what belongs there.",
+  "genres": [
+    { "id": "pop", "name": "Pop", "hint": "mainstream pop", "sub": [
+      { "id": "dance-pop", "name": "Dance Pop", "hint": "upbeat club-leaning pop" },
+      { "id": "synth-pop", "name": "Synth-Pop", "hint": "synth-driven pop, electropop, 80s-style pop" },
+      { "id": "pop-ballads", "name": "Pop Ballads", "hint": "slow, emotional pop songs" }
+    ]},
+    { "id": "k-pop", "name": "K-Pop", "hint": "Korean pop, idol groups, Korean R&B and hip hop" },
+    { "id": "j-pop", "name": "J-Pop", "hint": "Japanese pop and rock, anime and city pop" },
+    { "id": "hip-hop-rap", "name": "Hip-Hop & Rap", "hint": "hip hop and rap", "sub": [
+      { "id": "trap", "name": "Trap", "hint": "trap and rage rap, 808-heavy southern-style rap" },
+      { "id": "drill", "name": "Drill", "hint": "Chicago, UK and Brooklyn drill" },
+      { "id": "melodic-rap", "name": "Melodic Rap", "hint": "sung or melodic rap, emo rap, pop rap" },
+      { "id": "boom-bap", "name": "Boom Bap & Classic Hip-Hop", "hint": "90s and golden-era hip hop, boom bap, g-funk" },
+      { "id": "conscious-rap", "name": "Conscious & Lyrical Rap", "hint": "lyrical, storytelling, conscious rap" },
+      { "id": "uk-rap", "name": "UK Rap & Grime", "hint": "UK rap and grime (not drill)" }
+    ]},
+    { "id": "rb-soul", "name": "R&B & Soul", "hint": "R&B and soul", "sub": [
+      { "id": "contemporary-rnb", "name": "Contemporary R&B", "hint": "modern and alternative R&B" },
+      { "id": "neo-soul", "name": "Neo-Soul", "hint": "neo-soul" },
+      { "id": "classic-soul", "name": "Soul & Funk Classics", "hint": "Motown, classic soul, funk, disco, 70s-90s R&B" }
+    ]},
+    { "id": "electronic-dance", "name": "Electronic & Dance", "hint": "electronic and dance music", "sub": [
+      { "id": "house", "name": "House", "hint": "house, progressive and piano house" },
+      { "id": "deep-house", "name": "Deep House", "hint": "deep, melodic and organic house" },
+      { "id": "tech-house", "name": "Tech House", "hint": "tech house" },
+      { "id": "techno", "name": "Techno", "hint": "techno, melodic techno" },
+      { "id": "trance", "name": "Trance", "hint": "trance and psytrance" },
+      { "id": "dubstep", "name": "Dubstep", "hint": "dubstep, riddim, brostep" },
+      { "id": "drum-and-bass", "name": "Drum & Bass", "hint": "drum and bass, jungle, liquid dnb" },
+      { "id": "edm", "name": "EDM & Big Room", "hint": "festival EDM, big room, electro house, mainstream dance hits" },
+      { "id": "trap-bass", "name": "Trap & Bass", "hint": "EDM trap, bass music, hybrid trap (not rap trap)" },
+      { "id": "melodic-electronic", "name": "Melodic & Future Bass", "hint": "future bass, melodic bass, chill electronic, electronica" },
+      { "id": "uk-garage", "name": "UK Garage & Breaks", "hint": "UK garage, 2-step, breakbeat, jersey club" }
+    ]},
+    { "id": "rock", "name": "Rock", "hint": "rock", "sub": [
+      { "id": "classic-rock", "name": "Classic Rock", "hint": "60s-80s rock" },
+      { "id": "alternative-rock", "name": "Alternative Rock", "hint": "90s-today alternative and modern rock, grunge" },
+      { "id": "hard-rock", "name": "Hard Rock", "hint": "hard rock" }
+    ]},
+    { "id": "indie-alternative", "name": "Indie & Alternative", "hint": "indie and alternative", "sub": [
+      { "id": "indie-rock", "name": "Indie Rock", "hint": "indie rock, post-punk revival, garage rock" },
+      { "id": "indie-pop", "name": "Indie Pop", "hint": "indie pop, bedroom pop, alt-pop" },
+      { "id": "dream-pop", "name": "Dream Pop & Shoegaze", "hint": "dream pop, shoegaze, slowcore" }
+    ]},
+    { "id": "metal", "name": "Metal", "hint": "metal, metalcore, nu metal" },
+    { "id": "punk-emo", "name": "Punk & Emo", "hint": "punk, pop punk, emo, post-hardcore" },
+    { "id": "country", "name": "Country", "hint": "country", "sub": [
+      { "id": "modern-country", "name": "Modern Country", "hint": "country from the 2000s on, country pop" },
+      { "id": "classic-country", "name": "Classic Country", "hint": "older and traditional country, outlaw country" }
+    ]},
+    { "id": "folk-acoustic", "name": "Folk & Acoustic", "hint": "folk, singer-songwriter, Americana, acoustic" },
+    { "id": "latin", "name": "Latin", "hint": "Latin music", "sub": [
+      { "id": "reggaeton", "name": "Reggaeton & Latin Urban", "hint": "reggaeton, Latin trap, dembow" },
+      { "id": "latin-pop", "name": "Latin Pop", "hint": "Spanish-language pop" },
+      { "id": "regional-mexican", "name": "Regional Mexican", "hint": "corridos, banda, norteño, mariachi" },
+      { "id": "tropical", "name": "Bachata & Salsa", "hint": "bachata, salsa, merengue, cumbia" },
+      { "id": "brazilian", "name": "Brazilian", "hint": "funk carioca, sertanejo, MPB, bossa nova" }
+    ]},
+    { "id": "afrobeats", "name": "Afrobeats", "hint": "Afrobeats, Afropop, Afro-fusion", "sub": [
+      { "id": "amapiano", "name": "Amapiano", "hint": "amapiano, South African house and gqom" }
+    ]},
+    { "id": "reggae-dancehall", "name": "Reggae & Dancehall", "hint": "reggae, dancehall, soca" },
+    { "id": "jazz", "name": "Jazz", "hint": "jazz" },
+    { "id": "blues", "name": "Blues", "hint": "blues" },
+    { "id": "classical", "name": "Classical", "hint": "classical, opera, modern composers" },
+    { "id": "soundtracks", "name": "Soundtracks", "hint": "film, TV, game and musical theatre music" },
+    { "id": "chill-lo-fi", "name": "Chill & Lo-Fi", "hint": "lo-fi beats, ambient, sleep and study music" },
+    { "id": "christian-gospel", "name": "Christian & Gospel", "hint": "worship, gospel, Christian music" },
+    { "id": "world-regional", "name": "World & Regional", "hint": "Bollywood, Punjabi, Arabic, Turkish, C-Pop, OPM and other regional music" },
+    { "id": "holiday", "name": "Holiday", "hint": "Christmas and holiday songs" },
+    { "id": "comedy-spoken-word", "name": "Comedy & Spoken Word", "hint": "comedy, spoken word, poetry" },
+    { "id": "childrens", "name": "Children's", "hint": "children's music, lullabies" }
+  ]
+}

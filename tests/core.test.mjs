@@ -5,26 +5,34 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
-  createClient, fetchLikedTracks, RateLimitedError, dedupeTracks, groupTracks,
-  syncPlaylists, classifyTrack, UNCATEGORIZED, NOT_SORTED_YET, planSync, resolvePlaylists,
+  createClient, fetchLikedTracks, RateLimitedError, dedupeTracks, flattenTaxonomy, groupSongs,
+  syncPlaylists, UNCATEGORIZED, NOT_SORTED_YET, planSync, resolvePlaylists,
 } from "../docs/core.js";
 
 import { FakeSpotify, ME } from "./fake-spotify.mjs";
 
-const BUCKETS = JSON.parse(readFileSync(new URL("../docs/genres.json", import.meta.url))).buckets;
+const NODES = flattenTaxonomy(JSON.parse(readFileSync(new URL("../docs/taxonomy.json", import.meta.url))).genres);
 const track = (i, name, artistId, extra = {}) => ({
   added_at: `2026-01-${String(28 - (i % 28)).padStart(2, "0")}`,
   track: { id: `t${i}`, uri: `spotify:track:t${i}`, name, type: "track", artists: [{ id: artistId, name: artistId }], ...extra },
 });
+
+// The playlist Groq picks for each test artist's songs ("none": it doesn't know them).
+const LIB_PICKS = { rapper: "hip-hop-rap", indie: "indie-alternative", latin: "latin", nogenre: "none" };
 
 function library(n = 250) {
   const liked = [];
   for (let i = 0; i < n; i++) liked.push(track(i, `Song ${i}`, ["rapper", "indie", "latin", "nogenre"][i % 4]));
   return {
     liked,
-    artists: { rapper: ["chicago drill", "rap"], indie: ["bedroom pop"], latin: ["reggaeton"], nogenre: [] },
+    artists: {},
+    playlists: LIB_PICKS,
   };
 }
+
+/** uri -> playlist for every song, from an artist -> playlist map (standing in for Groq). */
+const picksFor = (tracks, byArtist, overrides = {}) =>
+  Object.fromEntries(tracks.map((t) => [t.uri, overrides[t.uri] ?? byArtist[t.artistIds[0]] ?? "none"]));
 
 function fakeClient(spotify, extra = {}) {
   return createClient({
@@ -33,12 +41,12 @@ function fakeClient(spotify, extra = {}) {
   });
 }
 
-// Artist genres come from Groq in the app; here the fake library's genres stand in for them.
+// Playlists come from Groq in the app; here the fake library's picks stand in for them.
 async function run(spotify, remembered = {}, { prefix = "Liked · " } = {}) {
   const api = fakeClient(spotify);
   const { tracks: liked } = await fetchLikedTracks(api);
   const { tracks } = dedupeTracks(liked);
-  const groups = groupTracks(tracks, spotify.artists, BUCKETS).filter((g) => g.bucket.id !== "uncategorized");
+  const groups = groupSongs(tracks, picksFor(tracks, LIB_PICKS), NODES).filter((g) => g.bucket.id !== "uncategorized");
   return syncPlaylists(api, {
     userId: ME, groups, nameFor: (b) => prefix + b.name, isPublic: false, remembered,
     remember: (id, info) => { remembered[id] = { ...remembered[id], ...info }; }, verifyDelayMs: 0,
@@ -68,7 +76,7 @@ test("first run creates one playlist per genre with every song once", async () =
   const sp = new FakeSpotify(library());
   const { results } = await run(sp);
   assert.equal(sp.creates, 3);
-  assert.deepEqual(results.map((r) => r.count), [62, 63, 63]);
+  assert.deepEqual(results.map((r) => [r.bucket.id, r.count]), [["hip-hop-rap", 63], ["indie-alternative", 63], ["latin", 62]]);
   assertNoDuplicates(sp);
 });
 
@@ -80,13 +88,13 @@ test("re-running, even from a different browser, never makes new playlists or do
   await run(sp, {});                  // fresh browser: found via description tag
   assert.equal(sp.creates, 3);
   assertNoDuplicates(sp);
-  assert.equal(sp.playlists.get("pl1").items.length, 62);
+  assert.equal(sp.playlists.get("pl1").items.length, 63);
 });
 
 test("renaming playlists in Spotify still doesn't cause duplicates", async () => {
   const sp = new FakeSpotify(library());
   await run(sp);
-  sp.playlists.get("pl1").name = "my latin bangers";
+  sp.playlists.get("pl1").name = "my rap bangers";
   await run(sp, {});
   assert.equal(sp.creates, 3);
   assertNoDuplicates(sp);
@@ -153,13 +161,6 @@ test("the same song liked from two releases is only included once", () => {
   const { tracks, removed } = dedupeTracks(raw);
   assert.deepEqual(tracks.map((t) => t.uri), ["a", "d", "e"]);
   assert.equal(removed, 3);
-});
-
-test("songs go to exactly one genre, using featured artists only as a fallback", () => {
-  const g = { a: ["pop", "dance pop", "edm"], b: ["trap"], c: [] };
-  assert.equal(classifyTrack({ artistIds: ["a", "b"] }, g, BUCKETS).id, "pop");
-  assert.equal(classifyTrack({ artistIds: ["c", "b"] }, g, BUCKETS).id, "hip-hop-rap");
-  assert.equal(classifyTrack({ artistIds: ["c"] }, g, BUCKETS), UNCATEGORIZED);
 });
 
 test("a short slow-down is waited out with two careful retries", async () => {
@@ -274,12 +275,12 @@ test("a playlist edited in Spotify, or with new songs, is rewritten exactly", as
   const sp = new FakeSpotify(library());
   const remembered = {};
   await run(sp, remembered);
-  sp.userAdds("pl1", "spotify:track:t0");      // someone added a song by hand
+  sp.userAdds("pl3", "spotify:track:t0");      // someone added a rap song to Latin by hand
   sp.liked.unshift(track(900, "New Rap Song", "rapper"));
   await run(sp, remembered);
   assertNoDuplicates(sp);
-  assert.equal(sp.playlists.get("pl1").items.length, 62, "hand-added song replaced by the sorted list");
-  assert.equal(sp.playlists.get("pl2").items[0], "spotify:track:t900");
+  assert.equal(sp.playlists.get("pl3").items.length, 62, "hand-added song replaced by the sorted list");
+  assert.equal(sp.playlists.get("pl1").items[0], "spotify:track:t900");
 });
 
 test("a clean write is checked with one count request; a troubled one is read back in full", async () => {
@@ -293,41 +294,23 @@ test("a clean write is checked with one count request; a troubled one is read ba
   assertNoDuplicates(sp2);
 });
 
-test("a song's own genre beats its artist's, and unsorted artists are set aside", () => {
-  const tracks = [
-    { uri: "a", name: "Rap One", artistIds: ["post"], artistNames: ["Post"] },
-    { uri: "b", name: "Rock One", artistIds: ["post"], artistNames: ["Post"] },
-    { uri: "c", name: "Later", artistIds: ["new"], artistNames: ["New"] },
-  ];
-  const groups = groupTracks(tracks, { post: ["melodic rap"] }, BUCKETS, {
-    songGenres: { b: ["alternative rock", "rock"] },
-    isPending: (t) => t.artistIds[0] === "new",
-  });
-  const where = Object.fromEntries(groups.flatMap((g) => g.tracks.map((t) => [t.uri, g.bucket.id])));
-  assert.deepEqual(where, { a: "hip-hop-rap", b: "indie-alternative", c: NOT_SORTED_YET.id });
-});
-
-test("a tie between genres goes to the tag listed first", () => {
-  const t = { uri: "x", artistIds: ["a"], artistNames: ["A"] };
-  assert.equal(classifyTrack(t, { a: ["pop", "country pop"] }, BUCKETS).id, "pop");
-  assert.equal(classifyTrack(t, { a: ["country pop", "pop"] }, BUCKETS).id, "country");
-  assert.equal(classifyTrack(t, { a: ["pop", "dance pop", "edm"] }, BUCKETS).id, "pop", "most votes still wins");
-});
-
 // ---- running more than once: the app's real sequence (group -> resolve -> plan -> sync)
 
-async function appRun(sp, remembered, { artistGenres, songGenres = {}, isPending, selected }) {
+async function appRun(sp, remembered, { byArtist, songPicks = {}, isPending, selected }) {
   const api = fakeClient(sp);
   const { tracks: liked } = await fetchLikedTracks(api);
   const { tracks } = dedupeTracks(liked);
-  const groups = groupTracks(tracks, artistGenres, BUCKETS, { songGenres, isPending });
   const nameFor = (b) => `Liked · ${b.name}`;
-  const { targets } = await resolvePlaylists(api, ME, [...BUCKETS, UNCATEGORIZED], nameFor, remembered);
-  // Like the app: every genre ticked except Uncategorized (and Not sorted yet can't be ticked).
+  const all = [...NODES, UNCATEGORIZED];
+  const { targets } = await resolvePlaylists(api, ME, all, nameFor, remembered);
+  // Like the app: subgenres that already have a playlist stay separate.
+  const existing = new Set([...targets].filter(([, t]) => !t.isNew).map(([id]) => id));
+  const groups = groupSongs(tracks, picksFor(tracks, byArtist, songPicks), NODES, { isPending, keepIds: existing });
+  // Like the app: everything ticked except Uncategorized (and Not sorted yet can't be ticked).
   const pick = selected || new Set(groups.map((g) => g.bucket.id).filter((id) => ![NOT_SORTED_YET.id, UNCATEGORIZED.id].includes(id)));
-  const plan = planSync(groups, targets, pick, BUCKETS);
+  const plan = planSync(groups, targets, pick, NODES);
   return syncPlaylists(api, {
-    userId: ME, groups: plan, nameFor, isPublic: false, remembered, verifyDelayMs: 0,
+    userId: ME, groups: plan, nameFor, isPublic: false, remembered, verifyDelayMs: 0, knownBuckets: all,
     remember: (id, info) => { remembered[id] = { ...remembered[id], ...info }; },
   });
 }
@@ -349,13 +332,13 @@ function swiftLibrary() {
 test("a song that changes genre on a later run is never left in two playlists, even if unticked", async () => {
   const sp = new FakeSpotify(swiftLibrary());
   const remembered = {};
-  const artistGenres = { swift: ["country pop"], bryan: ["classic oklahoma country"] };
-  await appRun(sp, remembered, { artistGenres });
+  const byArtist = { swift: "country", bryan: "country" };
+  await appRun(sp, remembered, { byArtist });
   assert.equal(sp.followed.length, 1, "day 1: everything is Country");
 
-  // Day 2: Swift's songs get their own tags; most are pop. The user only ticks Pop.
-  const songGenres = Object.fromEntries([...Array(9).keys()].map((i) => [`spotify:track:t${i}`, ["pop"]]));
-  await appRun(sp, remembered, { artistGenres, songGenres, selected: new Set(["pop"]) });
+  // Day 2: a re-sort puts most of Swift's songs in Pop. The user only ticks Pop.
+  const songPicks = Object.fromEntries([...Array(9).keys()].map((i) => [`spotify:track:t${i}`, "pop"]));
+  await appRun(sp, remembered, { byArtist, songPicks, selected: new Set(["pop"]) });
   assertEachSongOnce(sp);
   const country = sp.playlists.get("pl1").items;
   assert.equal(country.length, 11, "Country was updated even though it wasn't ticked");
@@ -365,12 +348,13 @@ test("a song that changes genre on a later run is never left in two playlists, e
 test("a genre whose songs all moved away is emptied, not left stale", async () => {
   const sp = new FakeSpotify(swiftLibrary());
   const remembered = {};
-  await appRun(sp, remembered, { artistGenres: { swift: ["country pop"], bryan: ["pop"] } });
+  await appRun(sp, remembered, { byArtist: { swift: "country", bryan: "pop" } });
   assert.equal(sp.followed.length, 2);
-  await appRun(sp, remembered, { artistGenres: { swift: ["pop"], bryan: ["pop"] } });
+  await appRun(sp, remembered, { byArtist: { swift: "pop", bryan: "pop" } });
   assertEachSongOnce(sp);
-  assert.equal(sp.playlists.get("pl1").items.length, 0, "Country is now empty");
-  assert.equal(sp.playlists.get("pl2").items.length, 20);
+  // Pop comes before Country in taxonomy.json, so pl1 is Pop and pl2 is Country.
+  assert.equal(sp.playlists.get("pl2").items.length, 0, "Country is now empty");
+  assert.equal(sp.playlists.get("pl1").items.length, 20);
 });
 
 test("a partial first day then a full second day uses the same playlists, every song once", async () => {
@@ -378,10 +362,10 @@ test("a partial first day then a full second day uses the same playlists, every 
   const sp = new FakeSpotify(lib);
   const remembered = {};
   // Day 1: Groq ran out before "latin" and "indie" were sorted.
-  await appRun(sp, remembered, { artistGenres: lib.artists, isPending: (t) => ["latin", "indie"].includes(t.artistIds[0]) });
+  await appRun(sp, remembered, { byArtist: lib.playlists, isPending: (t) => ["latin", "indie"].includes(t.artistIds[0]) });
   assert.equal(sp.followed.length, 1, "only Hip-Hop on day 1; Not sorted yet is never a playlist");
-  await appRun(sp, remembered, { artistGenres: lib.artists });
-  await appRun(sp, remembered, { artistGenres: lib.artists }); // and once more, for good measure
+  await appRun(sp, remembered, { byArtist: lib.playlists });
+  await appRun(sp, remembered, { byArtist: lib.playlists }); // and once more, for good measure
   assertEachSongOnce(sp);
   assert.equal(sp.creates, 3);
   assert.equal(sp.followed.reduce((n, id) => n + sp.playlists.get(id).items.length, 0), 300);
@@ -391,11 +375,84 @@ test("running twice in a row changes nothing the second time", async () => {
   const lib = library(400);
   const sp = new FakeSpotify(lib);
   const remembered = {};
-  await appRun(sp, remembered, { artistGenres: lib.artists });
+  await appRun(sp, remembered, { byArtist: lib.playlists });
   const before = JSON.stringify([...sp.playlists.values()].map((p) => p.items));
   sp.log = [];
-  const { results } = await appRun(sp, remembered, { artistGenres: lib.artists });
+  const { results } = await appRun(sp, remembered, { byArtist: lib.playlists });
   assert.ok(results.every((r) => r.unchanged));
   assert.equal(JSON.stringify([...sp.playlists.values()].map((p) => p.items)), before);
   assert.equal(sp.creates, 3);
 });
+
+// ---- subgenres: own playlist only with enough songs, and no flip-flopping
+
+function edmLibrary(deep, house) {
+  const liked = [];
+  let i = 0;
+  for (let k = 0; k < deep; k++) liked.push(track(i++, `Deep ${k}`, "deepdj"));
+  for (let k = 0; k < house; k++) liked.push(track(i++, `House ${k}`, "housedj"));
+  return { liked, artists: {} };
+}
+
+test("a subgenre gets its own playlist from 15 songs; fewer roll up into the broad genre", () => {
+  const tracks = edmLibrary(15, 14).liked.map((e) => ({ uri: e.track.uri, name: e.track.name, artistIds: [e.track.artists[0].id], artistNames: [] }));
+  const groups = groupSongs(tracks, picksFor(tracks, { deepdj: "deep-house", housedj: "house" }), NODES);
+  assert.deepEqual(groups.map((g) => [g.bucket.id, g.tracks.length]), [["electronic-dance", 14], ["deep-house", 15]]);
+});
+
+test("songs answered 'none', or given an id that isn't in the list, go to Uncategorized", () => {
+  const tracks = ["a", "b", "c"].map((u) => ({ uri: u, name: u, artistIds: ["x"], artistNames: [] }));
+  const groups = groupSongs(tracks, { a: "k-pop", b: "none", c: "made-up-genre" }, NODES);
+  assert.deepEqual(groups.map((g) => [g.bucket.id, g.tracks.length]), [["k-pop", 1], ["uncategorized", 2]]);
+});
+
+test("K-Pop and J-Pop are separate playlists", () => {
+  const tracks = ["a", "b"].map((u) => ({ uri: u, name: u, artistIds: ["x"], artistNames: [] }));
+  const groups = groupSongs(tracks, { a: "k-pop", b: "j-pop" }, NODES);
+  assert.deepEqual(groups.map((g) => g.bucket.id), ["k-pop", "j-pop"]);
+});
+
+test("a subgenre playlist that exists stays separate when it dips under 15 songs", async () => {
+  const sp = new FakeSpotify(edmLibrary(16, 20));
+  const remembered = {};
+  const byArtist = { deepdj: "deep-house", housedj: "house" };
+  await appRun(sp, remembered, { byArtist });
+  const names = () => sp.followed.map((id) => `${sp.playlists.get(id).name}:${sp.playlists.get(id).items.length}`).sort();
+  assert.deepEqual(names(), ["Liked · Deep House:16", "Liked · House:20"]);
+  // Two Deep House songs get re-sorted as House: Deep House now has 14, under the threshold.
+  const songPicks = { "spotify:track:t0": "house", "spotify:track:t1": "house" };
+  await appRun(sp, remembered, { byArtist, songPicks });
+  await appRun(sp, {}, { byArtist, songPicks }); // and from another browser
+  assert.deepEqual(names(), ["Liked · Deep House:14", "Liked · House:22"], "no flip into Electronic & Dance");
+  assertEachSongOnce(sp);
+});
+
+test("playlists for genres no longer in the list are emptied and reported, never left with songs", async () => {
+  const sp = new FakeSpotify(edmLibrary(3, 0));
+  sp.addPlaylist({ id: "old", name: "Liked · K-Pop & J-Pop", description: "Your K-Pop & J-Pop songs. [gs:k-pop-j-pop]",
+    items: ["spotify:track:t0", "spotify:track:t1"] });
+  const remembered = {};
+  const { retired } = await appRun(sp, remembered, { byArtist: { deepdj: "k-pop" } });
+  assert.deepEqual(retired.map((r) => r.playlistId), ["old"]);
+  assert.equal(sp.playlists.get("old").items.length, 0, "emptied");
+  assert.match(sp.playlists.get("old").description, /Safe to delete/);
+  assertEachSongOnce(sp);
+  sp.log = [];
+  await appRun(sp, remembered, { byArtist: { deepdj: "k-pop" } });
+  assert.ok(!sp.log.some((l) => l === "PUT /playlists/old/items"), "an already-empty retired playlist isn't rewritten");
+});
+
+test("syncing without the full playlist list never empties other playlists", async () => {
+  const sp = new FakeSpotify(library());
+  await run(sp, {});
+  const before = sp.followed.map((id) => sp.playlists.get(id).items.length);
+  // A sync of just one genre, without knownBuckets: the other two must be left alone.
+  const api = fakeClient(sp);
+  const { tracks } = dedupeTracks((await fetchLikedTracks(api)).tracks);
+  const latin = groupSongs(tracks, picksFor(tracks, LIB_PICKS), NODES).filter((g) => g.bucket.id === "latin");
+  const { retired } = await syncPlaylists(api, { userId: ME, groups: latin, nameFor: (b) => `Liked · ${b.name}`, isPublic: false,
+    remembered: {}, remember: () => {}, verifyDelayMs: 0 });
+  assert.deepEqual(retired, []);
+  assert.deepEqual(sp.followed.map((id) => sp.playlists.get(id).items.length), before);
+});
+

@@ -23,12 +23,12 @@
   const big = +new URLSearchParams(location.search).get("artists");
   let fake, groq;
   if (big) {
-    const styles = [["chicago drill", "rap"], ["bedroom pop"], ["reggaeton"], ["modern rock"], ["contemporary country"], ["house"]];
+    const styles = ["drill", "indie-pop", "reggaeton", "alternative-rock", "modern-country", "house", "deep-house", "k-pop", "j-pop", "techno"];
     const liked = [];
     const known = {};
     for (let a = 0; a < big; a++) {
       const name = `Artist ${a + 1}`;
-      known[name] = { tags: styles[a % styles.length] };
+      known[name] = styles[a % styles.length];
       for (let k = 0; k < 3; k++) {
         const i = a * 3 + k;
         liked.push({ added_at: new Date(Date.UTC(2026, 8, 30) - i * 6e4).toISOString(),

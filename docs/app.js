@@ -1,10 +1,10 @@
 import { CONFIG } from "./config.js";
 import {
-  createClient, fetchLikedTracks, dedupeTracks, groupTracks, bucketForTags,
+  createClient, fetchLikedTracks, dedupeTracks, flattenTaxonomy, groupSongs,
   resolvePlaylists, syncPlaylists, planSync, SpotifyError, RateLimitedError, UNCATEGORIZED, NOT_SORTED_YET,
 } from "./core.js";
 import {
-  createGroq, chooseModel, chatModels, clearUsageEstimates, tagArtists, tagSongs, pickPlaylists, estimateArtistJob,
+  createGroq, chooseModel, chatModels, clearUsageEstimates, classifySongs, estimateSongJob,
   GroqError, GroqDailyLimitError, PREFERRED_MODELS,
 } from "./groq.js";
 
@@ -338,192 +338,124 @@ async function scanLibrary() {
   state.total = tracks.length;
   state.dupesRemoved = removed;
 
-  // One entry per main artist (a song is sorted by its main artist), with a couple of
-  // their song titles so the model can tell apart artists who share a name.
-  const artists = new Map();
-  for (const t of tracks) {
-    const id = t.artistIds[0];
-    if (!id) continue;
-    const a = artists.get(id) || { id, name: t.artistNames[0], titles: [], songCount: 0 };
-    a.songCount++;
-    if (a.titles.length < 2) a.titles.push(t.name);
-    artists.set(id, a);
+  forgetOldVersionData();
+  // Each song is sorted on its own. Answers are saved per song (uri -> playlist id or
+  // "none") and tied to the playlist list they were chosen from: if that list changes (a
+  // genre added or split), songs are sorted again.
+  const listId = state.nodes.map((n) => n.id).join(",");
+  if (store.get("songPicksFor", "") !== listId) {
+    store.del("songPicks");
+    store.del("lastfmTried");
+    store.set("songPicksFor", listId);
   }
-
-  // Genres Spotify gave us on earlier runs are still good and cost nothing to reuse.
-  const spotifyGenres = store.get("artists", {});
-  const sortable = (tags) => !!bucketForTags(tags, state.buckets);
-  const artistTags = store.get("artistTags", {});
-  const songTags = store.get("songTags", {});
-  // Earlier versions saved artists the model never actually answered as "unknown" (no
-  // tags), which sent whole libraries to Uncategorized. Forget those once so they're
-  // asked again; from now on only an explicit blank answer is saved as unknown.
-  if (store.get("tagsFormat", 1) < 2) {
-    for (const [id, v] of Object.entries(artistTags)) if (!v.tags?.length) delete artistTags[id];
-    for (const [uri, v] of Object.entries(songTags)) if (!v.tags?.length) delete songTags[uri];
-    store.set("artistTags", artistTags);
-    store.set("songTags", songTags);
-    store.set("tagsFormat", 2);
-  }
+  const picks = store.get("songPicks", {});
+  const lfm = store.get("lastfmTags", {});
+  const toSong = (t) => ({
+    uri: t.uri, title: t.name, artist: t.artistNames[0] || "", featured: t.artistNames.slice(1, 4),
+    context: lfm[t.artistIds[0]] || [],
+  });
   let paused = null;
 
   try {
-    const need = [...artists.values()].filter((a) => !sortable(spotifyGenres[a.id]));
-    const todo = need.filter((a) => !(a.id in artistTags));
-    const estimate = estimateArtistJob(groq, todo);
-    // If nothing fits today, skip the plan: tagArtists stops before sending anything and the
-    // allowance screen offers the ways forward (check with Groq, another model).
-    if (estimate.startsToday && (estimate.minutes >= 3 || estimate.days > 1)) {
-      await confirmPlan(estimate, todo.length, need.length - todo.length);
+    const todo = tracks.filter((t) => !(t.uri in picks)).map(toSong);
+    const estimate = estimateSongJob(groq, todo, state.nodes);
+    // If nothing fits today, skip the plan: classifySongs stops before sending anything and
+    // the allowance screen offers the ways forward (check with Groq, another model).
+    if (todo.length && estimate.startsToday && (estimate.minutes >= 3 || estimate.days > 1)) {
+      await confirmPlan(estimate, todo.length, tracks.length - todo.length);
     }
     const startedAt = Date.now();
-    const artistLine = liveProgress("Sorting your artists…", "artists", estimate.minutes * 60000, STEPS.sort);
+    const line = liveProgress("Sorting your songs…", "songs", estimate.minutes * 60000, STEPS.sort);
     try {
-      await tagArtists(groq, need, artistTags, {
-        onProgress: (done, total) => artistLine.update(done, total),
-        onSaved: (c) => saveThrottled("artistTags", c),
+      await classifySongs(groq, todo, state.nodes, picks, {
+        onProgress: (done, total) => line.update(done, total),
+        onSaved: (c) => saveThrottled("songPicks", c),
       });
     } finally {
-      artistLine.stop();
+      line.stop();
+      saveThrottled("songPicks", picks, true);
     }
 
-    // Artists whose songs span different genres: sort those songs one by one.
-    const songs = tracks
-      .filter((t) => artistTags[t.artistIds[0]]?.mixed)
-      .map((t) => ({ uri: t.uri, title: t.name, artist: t.artistNames[0] }));
-    const songsLeft = songs.filter((x) => !(x.uri in songTags)).length;
-    const songLine = liveProgress("Sorting songs by artists who mix genres…", "songs",
-      ((songsLeft * 18) / groq.budget().tpm) * 60000 * 1.15, STEPS.sort);
-    try {
-      await tagSongs(groq, songs, songTags, {
-        onProgress: (done, total) => songLine.update(done, total),
-        onSaved: (c) => saveThrottled("songTags", c),
-      });
-    } finally {
-      songLine.stop();
+    // Optional second chance with real listener tags: songs Groq couldn't place are asked
+    // again with Last.fm's tags for their artist. Each song gets this chance once.
+    const lastfmKey = store.get("lastfm", "");
+    if (lastfmKey) {
+      const tried = new Set(store.get("lastfmTried", []));
+      const unplaced = tracks.filter((t) => picks[t.uri] === "none" && !tried.has(t.uri) && t.artistIds[0]);
+      const names = new Map(unplaced.map((t) => [t.artistIds[0], t.artistNames[0]]));
+      const need = [...names.keys()].filter((id) => !(id in lfm));
+      try {
+        for (const [i, id] of need.entries()) {
+          progress("Looking up artists on Last.fm…", i, need.length, `${i} of ${need.length} artists`, STEPS.sort);
+          const tags = await lastfmTags(names.get(id), lastfmKey);
+          if (tags) lfm[id] = tags;
+          if (i % 25 === 0) store.set("lastfmTags", lfm);
+          await new Promise((r) => setTimeout(r, 220)); // Last.fm allows about 5 requests a second
+        }
+      } finally {
+        store.set("lastfmTags", lfm);
+      }
+      const retry = unplaced.filter((t) => lfm[t.artistIds[0]]?.length);
+      for (const t of retry) delete picks[t.uri];
+      for (const t of unplaced) tried.add(t.uri);
+      store.set("lastfmTried", [...tried]);
+      if (retry.length) {
+        const again = liveProgress("Sorting songs again with Last.fm's tags…", "songs",
+          ((retry.length * 30) / groq.budget().tpm) * 60000, STEPS.sort);
+        try {
+          await classifySongs(groq, retry.map(toSong), state.nodes, picks, {
+            onProgress: (done, total) => again.update(done, total),
+            onSaved: (c) => saveThrottled("songPicks", c),
+          });
+        } finally {
+          again.stop();
+        }
+      }
     }
     state.sortedMs = Date.now() - startedAt;
   } catch (err) {
     if (!(err instanceof GroqDailyLimitError)) throw err;
     paused = err;
   } finally {
-    saveThrottled("artistTags", artistTags, true);
-    saveThrottled("songTags", songTags, true);
+    saveThrottled("songPicks", picks, true);
   }
 
-  // Everything known about each main artist, best source first.
-  const genres = {};
-  for (const id of artists.keys()) {
-    genres[id] = sortable(spotifyGenres[id]) ? spotifyGenres[id] : artistTags[id]?.tags || [];
-  }
-
-  // Last.fm helps artists the model didn't know (optional; real listener tags).
-  const lastfmKey = store.get("lastfm", "");
-  if (lastfmKey) {
-    const lfm = store.get("lastfmTags", {});
-    const need = [...artists.values()].filter((a) => a.id in artistTags && !sortable(genres[a.id]) && !(a.id in lfm));
-    try {
-      for (const [i, a] of need.entries()) {
-        progress("Filling in missing genres from Last.fm…", i, need.length, `${i} of ${need.length} artists`, STEPS.sort);
-        const tags = await lastfmTags(a.name, lastfmKey);
-        if (tags) lfm[a.id] = tags;
-        if (i % 25 === 0) store.set("lastfmTags", lfm);
-        await new Promise((r) => setTimeout(r, 220)); // Last.fm allows about 5 requests a second
-      }
-    } finally {
-      store.set("lastfmTags", lfm);
-    }
-    for (const id of artists.keys()) if (!sortable(genres[id]) && sortable(lfm[id])) genres[id] = lfm[id];
-  }
-
-  // Second pass: artists whose tags still don't fit any playlist (or who had none) get a
-  // playlist picked directly from the real list, using everything known about them:
-  // Groq's and Last.fm's tags, who they work with, and their songs. "none" keeps them in
-  // Uncategorized rather than guessing.
-  const lfmSaved = store.get("lastfmTags", {});
-  // Picks only make sense for the playlist list they were chosen from; if it changes
-  // (say a new genre is added to genres.json), ask again.
-  const listId = state.buckets.map((x) => x.id).join(",");
-  if (store.get("playlistPicksFor", "") !== listId) {
-    store.del("playlistPicks");
-    store.set("playlistPicksFor", listId);
-  }
-  const picks = store.get("playlistPicks", {});
-  if (!paused) {
-    const featured = new Map(); // main artist id -> names of artists on their songs
-    for (const t of tracks) {
-      const id = t.artistIds[0];
-      if (!id) continue;
-      const names = featured.get(id) || new Set();
-      for (const n of t.artistNames.slice(1)) if (names.size < 4) names.add(n);
-      featured.set(id, names);
-    }
-    const unplaced = [...artists.values()]
-      .filter((a) => a.id in artistTags && !sortable(genres[a.id]) && !(a.id in picks))
-      .map((a) => ({ ...a, tags: artistTags[a.id]?.tags || [], lastfm: lfmSaved[a.id] || [], featured: [...(featured.get(a.id) || [])] }));
-    if (unplaced.length) {
-      const pickLine = liveProgress("Placing the remaining artists…", "artists",
-        ((unplaced.length * 40) / groq.budget().tpm) * 60000 * 1.15, STEPS.sort);
-      try {
-        await pickPlaylists(groq, unplaced, state.buckets, picks, {
-          onProgress: (done, total) => pickLine.update(done, total),
-          onSaved: (c) => saveThrottled("playlistPicks", c),
-        });
-      } catch (err) {
-        if (!(err instanceof GroqDailyLimitError)) throw err;
-        paused = err;
-      } finally {
-        pickLine.stop();
-        saveThrottled("playlistPicks", picks, true);
-      }
-    }
-  }
-
-  const songGenres = Object.fromEntries(Object.entries(songTags).map(([uri, v]) => [uri, v.tags]));
-  const isPending = (t) => !!t.artistIds[0] && !sortable(spotifyGenres[t.artistIds[0]]) && !(t.artistIds[0] in artistTags);
-  const pickedBuckets = Object.fromEntries(Object.entries(picks).filter(([, v]) => v !== "none"));
-  state.groups = groupTracks(tracks, genres, state.buckets, { songGenres, isPending, picks: pickedBuckets });
-
-  // Why what's left in Uncategorized is there: artists nobody knows, or genres no playlist covers.
-  const leftover = state.groups.find((g) => g.bucket.id === UNCATEGORIZED.id)?.tracks || [];
-  const tagCounts = new Map();
-  let unknownSongs = 0;
-  for (const t of leftover) {
-    const id = t.artistIds[0];
-    const known = [...(artistTags[id]?.tags || []), ...(lfmSaved[id] || [])];
-    if (!known.length) { unknownSongs++; continue; }
-    for (const tag of new Set(known)) tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
-  }
-  state.leftover = {
-    unknownSongs,
-    unmatchedSongs: leftover.length - unknownSongs,
-    topTags: [...tagCounts].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([tag]) => tag),
-  };
+  // Grouping is redone once existing playlists are known (see showPreview): a subgenre
+  // that already has a playlist stays separate even with few songs.
+  state.regroup = (keepIds = new Set()) => groupSongs(tracks, picks, state.nodes, {
+    isPending: (t) => !(t.uri in picks), keepIds,
+  });
+  state.groups = state.regroup(new Set(Object.keys(store.get("playlists", {}))));
+  state.leftover = { hasLastfm: !!store.get("lastfm", "") };
   state.selected = new Set(state.groups
     .filter((g) => ![UNCATEGORIZED.id, NOT_SORTED_YET.id].includes(g.bucket.id) && g.tracks.length >= MIN_SONGS_PRESELECTED)
     .map((g) => g.bucket.id));
   state.groqResumeAt = paused?.resumeAt || null;
 
   if (!paused) store.del("groqDays"); // fully sorted: a future multi-day run starts at day 1
-  if (paused) {
-    const unsorted = [...artists.keys()].filter((id) => !sortable(spotifyGenres[id]) && !(id in artistTags)).length;
-    return showGroqPaused(paused, artists.size - unsorted, artists.size);
-  }
+  if (paused) return showGroqPaused(paused);
   return showPreview();
 }
 
-/** Before a long sort: how many artists, roughly how long, and whether it spans days. Waits for Start. */
+/** Saved data from versions that sorted by artist; none of it is used any more. */
+function forgetOldVersionData() {
+  if (store.get("dataVersion", 0) >= 3) return;
+  ["artists", "artistTags", "songTags", "tagsFormat", "playlistPicks", "playlistPicksFor"].forEach((k) => store.del(k));
+  store.set("dataVersion", 3);
+}
+
+/** Before a long sort: how many songs, roughly how long, and whether it spans days. Waits for Start. */
 function confirmPlan(estimate, todo, alreadySorted) {
   $("plan-lead").textContent = alreadySorted
-    ? `Picking up where you left off: ${alreadySorted.toLocaleString()} artists are already sorted.`
-    : "Groq will tag each of your artists with genres, the way Spotify does. This only happens once; later runs just sort newly liked artists.";
+    ? `Picking up where you left off: ${alreadySorted.toLocaleString()} songs are already sorted.`
+    : "Groq will pick the playlist each song fits best, judging every song on its own. This only happens once; later runs just sort newly liked songs.";
   $("plan-artists").textContent = todo.toLocaleString();
   $("plan-time").textContent = `~${estimate.minutes} min`;
   $("plan-time-label").textContent = estimate.days > 1 ? "estimated time today" : "estimated time";
   $("plan-days").textContent = estimate.days > 1 ? `${estimate.days} days` : "1 day";
   $("plan-note").textContent = estimate.days > 1
     ? `Your library will probably need more than one day of Groq's free allowance, so at least ${Math.round(estimate.todayShare * 100)}% gets sorted today, `
-      + "artists with the most songs first. You can make playlists right away and run again on the following days to sort the rest. "
+      + "most recently liked songs first. You can make playlists right away and run again on the following days to sort the rest. "
       + "Nothing is duplicated."
     : "You can switch to another tab while it runs. The tab's title shows the progress and changes to ✓ when it's done.";
   document.title = `Ready to start — ${APP_TITLE}`;
@@ -536,7 +468,7 @@ function confirmPlan(estimate, todo, alreadySorted) {
  * are and the ways forward: ask Groq directly, switch to a model with its own allowance,
  * or make playlists with what's sorted.
  */
-function showGroqPaused(err, sortedArtists, totalArtists) {
+function showGroqPaused(err) {
   const pendingSongs = state.groups.find((g) => g.bucket.id === NOT_SORTED_YET.id)?.tracks.length || 0;
   const sortedSongs = state.total - pendingSongs;
   const model = currentModel();
@@ -553,7 +485,7 @@ function showGroqPaused(err, sortedArtists, totalArtists) {
   }
   $("budget-fill").style.width = `${Math.round((sortedSongs / Math.max(1, state.total)) * 100)}%`;
   $("budget-progress").textContent = `${sortedSongs.toLocaleString()} of ${state.total.toLocaleString()} songs sorted`
-    + (pendingSongs ? ` (${sortedArtists.toLocaleString()} of ${totalArtists.toLocaleString()} artists; the ones with the most songs go first).` : ".");
+    + (pendingSongs ? " (most recently liked first)." : ".");
   $("budget-when").textContent = err.source === "groq"
     ? `Groq says ${model}'s allowance resets after ${formatWhen(err.resumeAt)}. Open this page again then and it continues where it stopped.`
     : `By the app's count, ${model}'s allowance frees up after ${formatWhen(err.resumeAt)}. Open this page again then and it continues where it stopped.`;
@@ -622,13 +554,21 @@ function showNotAllowed() {
 async function showPreview() {
   progress("Checking your existing playlists…", 0, 0, "", STEPS.save);
   try {
-    const { targets } = await resolvePlaylists(api, state.me.id, [...state.buckets, UNCATEGORIZED], nameFor,
+    const { targets } = await resolvePlaylists(api, state.me.id, [...state.nodes, UNCATEGORIZED], nameFor,
       store.get("playlists", {}));
     state.targets = targets;
   } catch {
-    state.targets = new Map(); // only used for the New/Update labels
+    state.targets = new Map(); // only used for labels and keeping existing playlists separate
   }
+  applyExistingPlaylists();
   renderPreview();
+}
+
+/** Re-groups so subgenres that already have a playlist stay separate (no flip-flopping). */
+function applyExistingPlaylists() {
+  if (!state.regroup) return;
+  const existing = new Set([...state.targets].filter(([, t]) => !t.isNew).map(([id]) => id));
+  state.groups = state.regroup(existing);
 }
 
 function renderPreview() {
@@ -644,18 +584,11 @@ function renderPreview() {
   document.title = `✓ Ready to review — ${APP_TITLE}`;
   const uncategorized = state.groups.find((g) => g.bucket.id === UNCATEGORIZED.id)?.tracks.length || 0;
   const genreCount = state.groups.filter((g) => ![UNCATEGORIZED.id, NOT_SORTED_YET.id].includes(g.bucket.id)).length;
-  const parts = [`${state.total.toLocaleString()} songs in ${genreCount} genres.`];
+  const parts = [`${state.total.toLocaleString()} songs in ${genreCount} playlists.`];
   if (state.dupesRemoved) parts.push(`${state.dupesRemoved} duplicate${state.dupesRemoved === 1 ? "" : "s"} skipped.`);
   if (uncategorized) {
-    const why = [];
-    const l = state.leftover || {};
-    if (l.unknownSongs) why.push(`${l.unknownSongs.toLocaleString()} by artists Groq doesn't recognise`);
-    if (l.unmatchedSongs) {
-      why.push(`${l.unmatchedSongs.toLocaleString()} with genres no playlist covers`
-        + (l.topTags?.length ? ` (like ${l.topTags.map((t) => `"${t}"`).join(", ")})` : ""));
-    }
-    parts.push(`${uncategorized.toLocaleString()} song${uncategorized === 1 ? "" : "s"} couldn't be matched to a genre`
-      + (why.length ? `: ${why.join("; ")}.` : "."));
+    parts.push(`${uncategorized.toLocaleString()} song${uncategorized === 1 ? "" : "s"} Groq couldn't place, usually because it `
+      + `doesn't know the song or artist${state.leftover?.hasLastfm ? "" : " (a free Last.fm key in Settings can help with these)"}.`);
   }
   const pending = state.groups.find((g) => g.bucket.id === NOT_SORTED_YET.id)?.tracks.length || 0;
   if (pending) {
@@ -666,7 +599,7 @@ function renderPreview() {
 
   // Genres that already have a playlist but no songs now (they all moved elsewhere).
   const shown = new Set(state.groups.map((g) => g.bucket.id));
-  const emptied = [...state.buckets, UNCATEGORIZED]
+  const emptied = [...state.nodes, UNCATEGORIZED]
     .filter((b) => !shown.has(b.id) && state.targets.get(b.id) && !state.targets.get(b.id).isNew)
     .map((bucket) => ({ bucket, tracks: [] }));
   const list = $("genre-list");
@@ -729,7 +662,9 @@ function genreRow(group) {
   }
   const meta = document.createElement("div");
   meta.className = "meta";
-  meta.textContent = tracks.length ? topArtists(tracks) : "Its songs now belong to other genres.";
+  const parentName = bucket.parent ? state.nodes.find((n) => n.id === bucket.parent)?.name : "";
+  meta.textContent = (parentName ? `${parentName} · ` : "")
+    + (tracks.length ? topArtists(tracks) : "Its songs now belong to other playlists.");
   text.append(name, meta);
 
   const count = document.createElement("span");
@@ -755,7 +690,7 @@ function genreRow(group) {
     const again = document.createElement("button");
     again.className = "link again";
     again.textContent = "Ask again";
-    again.title = "Ask Groq again about the artists in Uncategorized";
+    again.title = "Ask Groq again about the songs in Uncategorized";
     again.addEventListener("click", (e) => { e.stopPropagation(); askAgain(tracks); });
     head.append(box, text, count, again);
   } else {
@@ -766,27 +701,18 @@ function genreRow(group) {
 }
 
 function syncPlan() {
-  return planSync(state.groups, state.targets, state.selected, state.buckets);
+  return planSync(state.groups, state.targets, state.selected, state.nodes);
 }
 
-/**
- * Forgets what's saved for the artists behind these songs (Groq's answer, Last.fm tags and
- * any per-song tags), so the next run asks about them again.
- */
+/** Forgets the saved answers for these songs, so the next run asks Groq about them again. */
 function askAgain(tracks) {
-  const artistIds = new Set(tracks.map((t) => t.artistIds[0]).filter(Boolean));
-  if (!confirm(`Ask Groq again about ${artistIds.size.toLocaleString()} artist${artistIds.size === 1 ? "" : "s"} in Uncategorized? `
-    + "This uses some of today's Groq allowance. Artists Groq still doesn't know will stay in Uncategorized.")) return;
-  const artistTags = store.get("artistTags", {});
-  const lfm = store.get("lastfmTags", {});
-  const songTags = store.get("songTags", {});
-  const picks = store.get("playlistPicks", {});
-  for (const id of artistIds) { delete artistTags[id]; delete lfm[id]; delete picks[id]; }
-  store.set("playlistPicks", picks);
-  for (const t of tracks) delete songTags[t.uri];
-  store.set("artistTags", artistTags);
-  store.set("lastfmTags", lfm);
-  store.set("songTags", songTags);
+  if (!confirm(`Ask Groq again about ${tracks.length.toLocaleString()} song${tracks.length === 1 ? "" : "s"} in Uncategorized? `
+    + "This uses some of today's Groq allowance. Songs Groq still can't place will stay in Uncategorized.")) return;
+  const picks = store.get("songPicks", {});
+  const tried = new Set(store.get("lastfmTried", []));
+  for (const t of tracks) { delete picks[t.uri]; tried.delete(t.uri); }
+  store.set("songPicks", picks);
+  store.set("lastfmTried", [...tried]);
   scan();
 }
 
@@ -819,13 +745,15 @@ async function create() {
 }
 
 async function runSync() {
-  // Re-resolved inside syncPlaylists; this just decides which genres to write.
-  const { targets } = await resolvePlaylists(api, state.me.id, [...state.buckets, UNCATEGORIZED], nameFor, store.get("playlists", {}));
+  // Re-resolved inside syncPlaylists; this just decides which playlists to write.
+  const { targets } = await resolvePlaylists(api, state.me.id, [...state.nodes, UNCATEGORIZED], nameFor, store.get("playlists", {}));
   state.targets = targets;
+  applyExistingPlaylists();
   const groups = syncPlan();
   const remembered = store.get("playlists", {});
-  const { results, warnings } = await syncPlaylists(api, {
+  const { results, warnings, retired } = await syncPlaylists(api, {
     userId: state.me.id,
+    knownBuckets: [...state.nodes, UNCATEGORIZED],
     groups,
     nameFor,
     isPublic: store.get("public", false),
@@ -839,10 +767,10 @@ async function runSync() {
       else progress(`Saving ${bucket.name}…`, index, total, `Playlist ${index + 1} of ${total}`, STEPS.save);
     },
   });
-  showDone(results, warnings);
+  showDone(results, warnings, retired);
 }
 
-function showDone(results, warnings) {
+function showDone(results, warnings, retired = []) {
   const made = results.filter((r) => r.isNew).length;
   const same = results.filter((r) => r.unchanged).length;
   const updated = results.length - made - same;
@@ -881,6 +809,23 @@ function showDone(results, warnings) {
         li.append(a);
         div.querySelector("ul").append(li);
       }
+    }
+    box.append(div);
+  }
+  if (retired.length) {
+    const div = document.createElement("div");
+    div.className = "warning";
+    div.innerHTML = "<strong>Some older playlists aren't used any more</strong> (for example after K-Pop and J-Pop were split). "
+      + "They've been emptied so no song is in two playlists, and you can delete them in Spotify:<ul></ul>";
+    for (const r of retired) {
+      const li = document.createElement("li");
+      const a = document.createElement("a");
+      a.href = `https://open.spotify.com/playlist/${r.playlistId}`;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.textContent = r.name;
+      li.append(a);
+      div.querySelector("ul").append(li);
     }
     box.append(div);
   }
@@ -960,8 +905,8 @@ function wire() {
     login();
   });
   $("refresh-genres").addEventListener("click", () => {
-    if (!confirm("Sort every artist again from scratch? This uses Groq's daily allowance again, so a big library may take more than a day.")) return;
-    ["artists", "artistTags", "songTags", "lastfmTags", "playlistPicks"].forEach((k) => store.del(k));
+    if (!confirm("Sort every song again from scratch? This uses Groq's daily allowance again, so a big library may take more than a day.")) return;
+    ["songPicks", "lastfmTried", "lastfmTags"].forEach((k) => store.del(k));
     $("settings").close();
     if (store.get("token")) scan();
   });
@@ -984,7 +929,7 @@ async function start() {
     ["clientId", "token", "artists", "artistsAt", "playlists"].forEach((k) => store.del(k));
   }
   try {
-    state.buckets = (await (await fetch(new URL("./genres.json", import.meta.url))).json()).buckets;
+    state.nodes = flattenTaxonomy((await (await fetch(new URL("./taxonomy.json", import.meta.url))).json()).genres);
   } catch {
     return showError(new Error("Couldn't load the genre list. Please refresh the page."));
   }
