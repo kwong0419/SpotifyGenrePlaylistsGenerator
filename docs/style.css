@@ -152,3 +152,6 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
 .option p { margin: 0 0 10px; }
 select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; flex: 1 1 220px; }
 .genre-head .again { white-space: nowrap; font-size: .85rem; }
+
+a.secondary-link { display: inline-block; padding: 9px 18px; border: 1px solid var(--line); border-radius: 999px; color: var(--text); text-decoration: none; }
+a.secondary-link:hover { background: var(--bg); }

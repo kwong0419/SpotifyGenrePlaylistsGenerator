@@ -240,6 +240,18 @@ export function groupSongs(tracks, picks, nodes, { isPending = () => false, keep
   return [...groups.values()].filter((g) => g.tracks.length);
 }
 
+/**
+ * How one answer scores: "exact" if it's one of the playlists that count as right, "family"
+ * if it's in the same broad genre as one of them (say Deep House instead of House),
+ * "unknown" for "none", otherwise "wrong".
+ */
+export function scoreAnswer(answer, ok, nodes) {
+  if (ok.includes(answer)) return "exact";
+  if (answer === "none" || answer === undefined) return "unknown";
+  const family = (id) => nodes.find((n) => n.id === id)?.parent || id;
+  return ok.some((id) => family(id) === family(answer)) ? "family" : "wrong";
+}
+
 /** "Song - 2011 Remaster" and "Song (Remastered)" are the same song. */
 export function songKey(track) {
   const title = track.name

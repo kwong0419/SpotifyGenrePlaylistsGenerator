@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   createClient, fetchLikedTracks, RateLimitedError, dedupeTracks, flattenTaxonomy, groupSongs,
-  syncPlaylists, UNCATEGORIZED, NOT_SORTED_YET, planSync, resolvePlaylists,
+  syncPlaylists, UNCATEGORIZED, NOT_SORTED_YET, planSync, resolvePlaylists, scoreAnswer,
 } from "../docs/core.js";
 
 import { FakeSpotify, ME } from "./fake-spotify.mjs";
@@ -456,3 +456,10 @@ test("syncing without the full playlist list never empties other playlists", asy
   assert.deepEqual(sp.followed.map((id) => sp.playlists.get(id).items.length), before);
 });
 
+test("accuracy scoring: right playlist, right genre, wrong genre, didn't know", () => {
+  assert.equal(scoreAnswer("deep-house", ["deep-house", "melodic-electronic"], NODES), "exact");
+  assert.equal(scoreAnswer("tech-house", ["deep-house"], NODES), "family", "a sibling subgenre");
+  assert.equal(scoreAnswer("electronic-dance", ["deep-house"], NODES), "family", "the broad genre itself");
+  assert.equal(scoreAnswer("k-pop", ["j-pop"], NODES), "wrong", "K-Pop and J-Pop are separate genres");
+  assert.equal(scoreAnswer("none", ["jazz"], NODES), "unknown");
+});
