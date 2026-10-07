@@ -73,6 +73,7 @@ export const estimateTokens = (text) => Math.ceil(text.length / 3.5);
  */
 export const isReasoningModel = (model) => /gpt-oss|qwen3|qwq|deepseek-r1|reason/i.test(model || "");
 export const REASONING_ROOM = 1024;
+const CAREFUL_REASONING_ROOM = 2048; // for reasoning_effort "medium"
 
 /** "Please try again in 1h2m3.5s" -> ms */
 function parseTryAgain(message) {
@@ -223,16 +224,16 @@ export function createGroq({
      * strict structured output is requested (constrained decoding: the reply always matches
      * the schema). Returns the raw { text, cutOff }; cutOff means it hit the length limit.
      */
-    async chat(system, user, maxTokens, schema = null) {
+    async chat(system, user, maxTokens, schema = null, { careful = false } = {}) {
       const reasoning = isReasoningModel(model);
-      if (reasoning) maxTokens += REASONING_ROOM;
+      if (reasoning) maxTokens += careful ? CAREFUL_REASONING_ROOM : REASONING_ROOM;
       const estimated = estimateTokens(system + user) + maxTokens;
       await waitForBudget(estimated);
       let data;
       try {
         data = await call("/chat/completions", {
           model, temperature: 0, max_tokens: maxTokens,
-          ...(reasoning ? { reasoning_effort: "low", include_reasoning: false } : {}),
+          ...(reasoning ? { reasoning_effort: careful ? "medium" : "low", include_reasoning: false } : {}),
           ...(schema ? { response_format: { type: "json_schema", json_schema: { name: "genres", strict: true, schema } } } : {}),
           messages: [{ role: "system", content: system }, { role: "user", content: user }],
         });
@@ -269,25 +270,42 @@ const modeFor = (model) => (supportsStrictOutput(model) ? "json" : "lines");
 
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
-// Reply room per song. A structured answer {"n":12,"playlist":"deep-house"} is ~14 tokens
-// (more when the model spaces it out); a line "12: deep-house" ~6. Room is generous so
-// replies are rarely cut off, and a cut-off reply still yields its complete answers.
-const ROOM = { json: 22, lines: 10 };
-const TYPICAL = { json: 14, lines: 6 };
-// The playlist list is ~1,200 tokens per request, so bigger batches waste less on repeating
-// it; 90 songs keeps a request (with its reply room) under gpt-oss-120b's per-minute cap.
-const SONG_BATCH = 90;
+// Reply room per song. A structured answer {"n": 37, "w": "icarus", "p": "classical", "c": "h"}
+// is ~20 tokens as the model spaces it out (short keys keep every answer cheap); a line
+// "37: classical" ~6. Room is generous so replies are rarely cut off, and a cut-off reply
+// still yields its complete answers.
+const ROOM = { json: 34, lines: 10 };
+const TYPICAL = { json: 22, lines: 6 };
+// The playlist list is ~1,100 tokens per request, so bigger batches waste less on repeating
+// it; 80 songs keeps a request (with its reply room) under gpt-oss-120b's per-minute cap.
+const SONG_BATCH = 80;
+// Songs the model was unsure about get a second, more careful look in smaller batches.
+const CAREFUL_BATCH = 30;
+const MAX_EXAMPLES = 20;
 
-/** The instructions, with the playlist list (subgenres indented under their genre). */
-export function sortingTask(nodes) {
-  const list = nodes.map((n) => `${n.parent ? "  " : ""}${n.id}: ${n.name} (${n.hint})`).join("\n");
+/**
+ * The instructions, with the playlist list (subgenres indented under their genre).
+ * `examples` are songs the listener placed themselves ([{ title, artist, playlist }]),
+ * shown so the model follows their taste. `careful` is for the second look.
+ */
+export function sortingTask(nodes, { examples = [], careful = false } = {}) {
+  const list = nodes.map((n) => `${n.parent ? "  " : ""}${n.id}: ${n.hint}`).join("\n");
+  const taste = examples.length
+    ? `\nThe listener placed these songs themselves; place similar songs the same way:\n${examples.slice(0, MAX_EXAMPLES)
+      .map((e) => `"${clip(e.title, 50)}" by ${clip(e.artist, 30)} -> ${e.playlist}`).join("\n")}`
+    : "";
   return `You sort songs into playlists. For each numbered song, pick the most specific playlist it fits, from this list (answer with the id). Indented entries are subgenres of the entry above: pick a subgenre when the song clearly fits it, otherwise the broad genre.
 ${list}
-Judge each song itself, not just its artist: an artist's songs can belong in different playlists. Use what you know about the song and the artist, and any listener tags given. Answer "none" only if you don't recognise the song or its artist and nothing given places it; never guess from a name alone.`;
+Judge each song itself, not just its artist: an artist's songs can belong in different playlists. Go by how the song actually sounds, from what you know about the song and the artist. Listener tags and Apple Music genres, when given, are real data about the song: trust them over impressions.
+Never judge by an artist's name, a title's language, or its capitals or styling: an all-caps title is not a sign of K-Pop, and a Spanish or Korean surname is not a sign of Latin music or K-Pop.
+Answer "none" if you don't recognise the song or its artist and nothing given places it.
+Confidence: "h" (high) if you know the song, or the artist's sound well enough to place it; "m" (medium) if you know the artist but not this song; "l" (low) if you don't really know them and are relying on weak clues.${taste}${careful
+    ? "\nThese are songs you were unsure about before: think about each one carefully, and keep confidence \"l\" for any you still can't place with real knowledge."
+    : ""}`;
 }
 
 const FORMAT = {
-  json: "Give exactly one result per numbered song, with its number n.",
+  json: "Give exactly one result per numbered song: n = its number, w = the first two words of its title (or its only word), p = the playlist id, c = your confidence.",
   lines: "Reply with exactly one line per song, starting with its number, and nothing else, e.g.\n1: deep-house\n2: none",
 };
 
@@ -295,13 +313,24 @@ const songLine = (s) => {
   const extra = [];
   if (s.featured?.length) extra.push(`feat. ${s.featured.map((f) => clip(f, 30)).join(", ")}`);
   if (s.context?.length) extra.push(`listener tags for the artist: ${s.context.join(", ")}`);
+  if (s.songTags?.length) extra.push(`listener tags for this song: ${s.songTags.join(", ")}`);
+  if (s.storeGenre) extra.push(`Apple Music genre: ${s.storeGenre}`);
   return `"${clip(s.title, 70)}" by ${clip(s.artist, 40)}${extra.length ? ` (${extra.join("; ")})` : ""}`;
 };
 
+/** The words of a title, simplified for comparing ("Don't Stop" -> ["don", "t", "stop"]). */
+const words = (text) => String(text ?? "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+  .toLowerCase().match(/[\p{L}\p{N}]+/gu) || [];
+/** The first word of a title ("Don't Stop" -> "don"). */
+export const firstWord = (text) => words(text)[0] || "";
+
 /**
- * Reading answers. Only a real playlist id (or its exact name, or "none") is accepted:
- * strict mode can't produce anything else, and in the line format anything else is
- * ignored and asked again. Numbers outside 1..count are ignored; the first answer wins.
+ * Reading answers into Map(n -> { playlist, confidence }). Only a real playlist id (or its
+ * exact name, or "none") is accepted: strict mode can't produce anything else, and in the
+ * line format anything else is ignored and asked again. In structured answers the echoed
+ * first two words of the title must match the song with that number; if they don't, the answer
+ * was meant for a different song and is dropped (the song is asked again). Numbers outside
+ * the batch are ignored, and the first answer for a number wins.
  */
 export function answerReader(nodes) {
   const lookup = new Map(nodes.flatMap((n) => [[n.id, n.id], [n.name.toLowerCase(), n.id]]));
@@ -309,29 +338,43 @@ export function answerReader(nodes) {
     const k = String(v ?? "").trim().replace(/^["'`*]+|["'`*.]+$/g, "").toLowerCase();
     return k === "none" ? "none" : lookup.get(k) || null;
   };
-  const json = (text, count) => {
+  // The answer must repeat the title's first two words (or its only word): one word alone
+  // can't tell apart neighbouring songs that both start with "The" or "Love".
+  const sameWord = (given, title) => {
+    const want = words(title).slice(0, 2);
+    const got = words(given).slice(0, 2);
+    if (!want.length) return true;
+    if (got.length < want.length) return false;
+    return want.every((w, i) => got[i] === w || w.startsWith(got[i]) || got[i].startsWith(w));
+  };
+  const json = (text, batch) => {
     const out = new Map();
-    const add = (n, pick) => {
+    const add = (n, word, pick, confidence) => {
       const v = valid(pick);
       const k = String(n);
-      if (v && Number.isInteger(+n) && +n >= 1 && +n <= count && !out.has(k)) out.set(k, v);
+      const song = batch[+n - 1];
+      if (!v || !Number.isInteger(+n) || !song || out.has(k)) return;
+      if (!sameWord(word, song.title)) return; // meant for another song
+      out.set(k, { playlist: v, confidence: ["high", "medium", "low"].includes(confidence) ? confidence : "medium" });
     };
+    const CONFIDENCE = { h: "high", m: "medium", l: "low" };
     try {
       const data = JSON.parse(text);
-      for (const r of Array.isArray(data?.results) ? data.results : []) add(r?.n, r?.playlist);
+      for (const r of Array.isArray(data?.results) ? data.results : []) add(r?.n, r?.w, r?.p, CONFIDENCE[r?.c]);
       return out;
     } catch { /* cut off: pick out the complete answers */ }
-    for (const m of text.matchAll(/\{\s*"n"\s*:\s*(\d+)\s*,\s*"playlist"\s*:\s*"([^"]*)"\s*\}/g)) add(+m[1], m[2]);
+    const one = /\{\s*"n"\s*:\s*(\d+)\s*,\s*"w"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"p"\s*:\s*"([^"]*)"\s*,\s*"c"\s*:\s*"([^"]*)"\s*\}/g;
+    for (const m of text.matchAll(one)) add(+m[1], m[2], m[3], CONFIDENCE[m[4]]);
     return out;
   };
-  const lines = (text, count, cutOff) => {
+  const lines = (text, batch, cutOff) => {
     let rows = text.split(/\r?\n/);
     if (cutOff) rows = rows.slice(0, -1); // the last line may be half-written
     const out = new Map();
     for (const raw of rows) {
       const m = /^\s*[*-]?\s*\**(\d+)\**\s*[:.)\]–-]\s*(.*)$/.exec(raw);
       const v = m && valid(m[2]);
-      if (v && +m[1] >= 1 && +m[1] <= count && !out.has(m[1])) out.set(m[1], v);
+      if (v && +m[1] >= 1 && +m[1] <= batch.length && !out.has(m[1])) out.set(m[1], { playlist: v, confidence: "medium" });
     }
     return out;
   };
@@ -345,8 +388,13 @@ const answerSchema = (nodes) => ({
       type: "array",
       items: {
         type: "object",
-        properties: { n: { type: "integer" }, playlist: { type: "string", enum: [...nodes.map((n) => n.id), "none"] } },
-        required: ["n", "playlist"],
+        properties: {
+          n: { type: "integer" },
+          w: { type: "string" },
+          p: { type: "string", enum: [...nodes.map((n) => n.id), "none"] },
+          c: { type: "string", enum: ["h", "m", "l"] },
+        },
+        required: ["n", "w", "p", "c"],
         additionalProperties: false,
       },
     },
@@ -358,14 +406,20 @@ const answerSchema = (nodes) => ({
 /**
  * Roughly how long sorting these songs takes and how much of the daily allowance it needs:
  * { tokens, minutes, days, todayShare, startsToday }. days > 1 means it continues on later
- * days; startsToday false means not even one request fits in today's allowance.
+ * days; startsToday false means not even one request fits in today's allowance. Includes
+ * the second look for unsure songs (assumed ~10% of them).
  */
 export function estimateSongJob(groq, songs, nodes, batchSize = SONG_BATCH) {
   const mode = modeFor(groq.model);
   const reasoning = isReasoningModel(groq.model);
   const perBatch = estimateTokens(`${sortingTask(nodes)}\n${FORMAT[mode]}`) + 40 + (reasoning ? 300 : 0);
-  const tokens = songs.reduce((n, s) => n + estimateTokens(songLine(s)) + 3 + TYPICAL[mode], 0)
-    + Math.ceil(songs.length / batchSize) * perBatch;
+  const perSong = (s) => estimateTokens(songLine(s)) + 3 + TYPICAL[mode];
+  const main = songs.reduce((n, s) => n + perSong(s), 0) + Math.ceil(songs.length / batchSize) * perBatch;
+  const unsure = Math.ceil(songs.length * 0.1);
+  const second = mode === "json"
+    ? unsure * (perSong({ title: "a typical song", artist: "an artist" }) + 15) + Math.ceil(unsure / CAREFUL_BATCH) * (perBatch + (reasoning ? 600 : 0))
+    : 0;
+  const tokens = main + second;
   const { tpm, tpd, dayLeft } = groq.budget();
   const smallestRequest = perBatch + 5 * (ROOM[mode] + 20) + (reasoning ? REASONING_ROOM : 0);
   if (songs.length && dayLeft < smallestRequest) {
@@ -379,29 +433,53 @@ export function estimateSongJob(groq, songs, nodes, batchSize = SONG_BATCH) {
 }
 
 /**
- * Sorts songs not yet in `cache` (song uri -> playlist id or "none"), mutating it, in the
- * order given. `songs` is [{ uri, title, artist, featured, context }] (context: optional
- * listener tags for the artist). Throws GroqDailyLimitError when the allowance runs out,
- * with everything sorted so far already in `cache`.
+ * Sorts songs not yet in `cache` (song uri -> { playlist, confidence }), mutating it, in
+ * the order given. `songs` is [{ uri, title, artist, featured, context }] (context: optional
+ * listener tags for the artist).
+ *
+ * Answers with low confidence aren't saved straight away: those songs get a second, more
+ * careful look in small batches (with `moreContext(song)`'s extra evidence, e.g. Last.fm
+ * tags for the song, if given). Anything still low-confidence after that is saved as
+ * "none" (Uncategorized) rather than put in a playlist on weak clues.
+ * `examples` are the listener's own placements, shown to the model.
+ * Throws GroqDailyLimitError when the allowance runs out, with everything sorted so far
+ * already in `cache` (unsure songs not yet re-checked are simply asked again next run).
  */
-export async function classifySongs(groq, songs, nodes, cache, { batchSize = SONG_BATCH, onProgress = () => {}, onSaved = () => {} } = {}) {
+export async function classifySongs(groq, songs, nodes, cache, {
+  batchSize = SONG_BATCH, examples = [], moreContext = null, onProgress = () => {}, onSaved = () => {},
+  onLookup = () => {},
+} = {}) {
   const todo = songs.filter((s) => !(s.uri in cache));
   const read = answerReader(nodes);
+  const spec = (careful) => ({
+    task: sortingTask(nodes, { examples, careful }), format: FORMAT, room: ROOM, schema: answerSchema(nodes),
+    parseJson: read.json, parseLines: read.lines, careful,
+  });
+  const unsure = [];
   let done = 0;
   onProgress(0, todo.length);
-  await runBatches(groq, todo, {
-    spec: {
-      task: sortingTask(nodes), format: FORMAT, room: ROOM, schema: answerSchema(nodes),
-      parseJson: read.json, parseLines: read.lines,
-    },
-    batchSize, key: (s) => s.uri, line: songLine,
-    onBatch: (results) => {
-      Object.assign(cache, results);
-      done += Object.keys(results).length;
-      onSaved(cache);
-      onProgress(done, todo.length);
-    },
-  });
+  const save = (results, careful) => {
+    for (const [uri, a] of Object.entries(results)) {
+      if (a.confidence === "low" && !careful) { unsure.push(uri); continue; }
+      cache[uri] = a.confidence === "low" ? { playlist: "none", confidence: "low" } : a;
+      done++;
+    }
+    onSaved(cache);
+    onProgress(done, todo.length);
+  };
+
+  await runBatches(groq, todo, { spec: spec(false), batchSize, key: (s) => s.uri, line: songLine, onBatch: (r) => save(r, false) });
+
+  if (unsure.length) {
+    const bySong = new Map(todo.map((s) => [s.uri, s]));
+    const again = [];
+    for (const [i, uri] of unsure.entries()) {
+      const s = bySong.get(uri);
+      if (moreContext) onLookup(i, unsure.length);
+      again.push(moreContext ? { ...s, ...(await moreContext(s)) } : s);
+    }
+    await runBatches(groq, again, { spec: spec(true), batchSize: CAREFUL_BATCH, key: (s) => s.uri, line: songLine, onBatch: (r) => save(r, true) });
+  }
   return cache;
 }
 
@@ -435,10 +513,11 @@ async function runBatches(groq, items, { spec, line, key, batchSize, onBatch }) 
     const user = batch.map((it, i) => `${i + 1}. ${line(it)}`).join("\n");
     const max = Math.min(4000, 40 + batch.length * spec.room[mode]);
     try {
-      const reply = await groq.chat(`${spec.task}\n${spec.format[mode]}`, user, max, mode === "json" ? spec.schema : null);
+      const reply = await groq.chat(`${spec.task}\n${spec.format[mode]}`, user, max, mode === "json" ? spec.schema : null,
+        { careful: !!spec.careful });
       const answers = mode === "json"
-        ? spec.parseJson(reply.text, batch.length)
-        : spec.parseLines(reply.text, batch.length, reply.cutOff);
+        ? spec.parseJson(reply.text, batch)
+        : spec.parseLines(reply.text, batch, reply.cutOff);
       return { answers, text: reply.text };
     } catch (err) {
       if (err instanceof GroqError && err.kind === "no_schema" && mode === "json") {
