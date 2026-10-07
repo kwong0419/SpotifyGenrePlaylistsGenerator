@@ -53,6 +53,14 @@
     fetch: (url, opts) =>
       String(url).startsWith("https://api.spotify.com/") ? fake.fetch(url, opts) : fetch(url, opts),
     groqFetch: groq.fetch, // any key works in the demo
+    // A simulated Apple Music search: knows a few songs' genres.
+    appleFetch: async (url) => {
+      const term = new URL(url).searchParams.get("term");
+      const known = { "Small Local Band Midnight": "Singer/Songwriter" };
+      const genre = known[term];
+      return { ok: true, status: 200, json: async () => ({ results: genre
+        ? [{ trackName: term.split(" ").pop(), artistName: "Small Local Band", primaryGenreName: genre }] : [] }) };
+    },
   };
   // Each page load is a fresh simulated account, so start logged out every time.
   Object.keys(localStorage).filter((k) => k.startsWith("gs-demo.")).forEach((k) => localStorage.removeItem(k));

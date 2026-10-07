@@ -32,16 +32,24 @@ when it's done.
 3. **A subgenre becomes its own playlist once it has 15 songs** (or already has a playlist from an
    earlier run, so playlists don't flip between runs). Otherwise its songs go into the broad genre's
    playlist, so a library with three techno songs gets them in *Electronic & Dance*, not a tiny playlist.
-4. Optionally, songs the model couldn't place are asked again with Last.fm's listener tags for their
-   artist.
+4. Every answer says how sure the model is and repeats the first two words of the song's title, so
+   an answer meant for a different song is caught and asked again. The model is told never to judge
+   by names, a title's language or its capitals (an all-caps title isn't a sign of K-Pop).
+5. **Songs it's unsure about get a second, more careful look**, with real catalog data the model
+   can't look up itself: the genre Apple Music gives the song (free, no key; e.g. "Classical
+   Crossover" for Tony Ann's *ICARUS*) and, with a free Last.fm key, listener tags for the song
+   ("piano", "instrumental"). Anything still unsure goes to Uncategorized, not a guessed playlist.
+6. **You can move any song** from the preview ("Move to…"). Your choice always wins, and your
+   choices are shown to the model as examples of your taste on later runs.
 
 Groq replies use [strict structured outputs](https://console.groq.com/docs/structured-outputs) where
 the model supports them, so the answer can only be a real playlist from the list; other models answer
 in numbered lines, and anything that isn't a real playlist is ignored and asked again.
 
 Answers are saved in your browser, so later runs only send newly liked songs. Sorting a 7,000-song
-library the first time takes about two days of Groq's free allowance; you can make playlists from
-what's sorted on day one.
+library the first time takes about three days of Groq's free allowance; you can make playlists from
+what's sorted on day one. When the sorting method improves, songs are re-checked the same way, and
+each keeps its current playlist until it has been.
 
 ### Check the accuracy first
 

@@ -49,9 +49,13 @@ function library(n) {
 function assertNoWrongAnswers(cache, artists, songs) {
   for (const s of songs) {
     if (!(s.uri in cache)) continue;
-    assert.equal(cache[s.uri], artists[s.artist] ?? "none", `${s.title} got someone else's playlist`);
+    assert.equal(cache[s.uri].playlist, artists[s.artist] ?? "none", `${s.title} got someone else's playlist`);
   }
 }
+
+/** uri -> playlist, without the confidence. */
+const plain = (cache) => Object.fromEntries(Object.entries(cache).map(([k, v]) => [k, v.playlist]));
+const batchOf = (...titles) => titles.map((title) => ({ title }));
 
 // ---- basics
 
@@ -61,7 +65,7 @@ test("songs are sorted in batches, saved, and never sent twice", async () => {
   const cache = {};
   await classifySongs(client, songs, NODES, cache);
   assert.equal(Object.keys(cache).length, 200);
-  assert.deepEqual(groq.calls, [90, 90, 20]);
+  assert.deepEqual(groq.calls, [80, 80, 40]);
   assertNoWrongAnswers(cache, artists, songs);
   await classifySongs(client, songs, NODES, cache);
   assert.equal(groq.requests, 3, "a second run sends nothing");
@@ -74,7 +78,7 @@ test("a song the model doesn't know is saved as 'none'", async () => {
     { uri: "a", title: "Hit", artist: "Known", featured: [] },
     { uri: "b", title: "Demo", artist: "Totally Unknown Band", featured: [] },
   ], NODES, cache);
-  assert.deepEqual(cache, { a: "k-pop", b: "none" });
+  assert.deepEqual(plain(cache), { a: "k-pop", b: "none" });
 });
 
 test("each song is judged on its own: one artist's songs can land in different playlists", async () => {
@@ -82,7 +86,7 @@ test("each song is judged on its own: one artist's songs can land in different p
   const { client } = setup({ groq });
   const cache = {};
   await classifySongs(client, ["God's Plan", "Passionfruit", "Jungle"].map((t, i) => ({ uri: `d${i}`, title: t, artist: "Drake", featured: [] })), NODES, cache);
-  assert.deepEqual(cache, { d0: "melodic-rap", d1: "contemporary-rnb", d2: "deep-house" });
+  assert.deepEqual(plain(cache), { d0: "melodic-rap", d1: "contemporary-rnb", d2: "deep-house" });
 });
 
 test("featured artists and listener tags are passed on to the model", async () => {
@@ -91,7 +95,7 @@ test("featured artists and listener tags are passed on to the model", async () =
   const { client } = setup({ groq });
   const cache = {};
   await classifySongs(client, [{ uri: "x", title: "Yahyuppiyah", artist: "Uncle Waffles", featured: ["Tony Duardo"], context: ["amapiano", "south african house"] }], NODES, cache);
-  assert.equal(cache.x, "amapiano");
+  assert.equal(cache.x.playlist, "amapiano");
   assert.match(groq.seen[0], /feat\. Tony Duardo; listener tags for the artist: amapiano, south african house/);
 });
 
@@ -107,7 +111,7 @@ test("with a strict-mode model every request is structured, and answers can only
   assert.equal(Object.keys(cache).length, 300);
   assert.equal(groq.structuredRequests, groq.requests);
   const ids = new Set([...NODES.map((n) => n.id), "none"]);
-  assert.ok(Object.values(cache).every((v) => ids.has(v)), "every answer is a real playlist or none");
+  assert.ok(Object.values(cache).every((v) => ids.has(v.playlist)), "every answer is a real playlist or none");
 });
 
 test("a structured reply cut off at the length limit keeps every complete answer", async () => {
@@ -147,13 +151,14 @@ test("line format: a made-up playlist is never saved", async () => {
   await classifySongs(client, [{ uri: "a", title: "One", artist: "A", featured: [] }], NODES, cache);
   groq.invent = "bollywood bangers";
   await classifySongs(client, [{ uri: "b", title: "Two", artist: "A", featured: [] }], NODES, cache).catch(() => {});
-  assert.deepEqual(cache, { a: "k-pop" }, "only the real answer was kept; the other is asked again next run");
+  assert.deepEqual(plain(cache), { a: "k-pop" }, "only the real answer was kept; the other is asked again next run");
 });
 
 test("line format: a playlist named instead of its id, and chatter around the answers, are understood", () => {
   const read = answerReader(NODES);
   const reply = "Sure! Here you go:\n1: Deep House\n2: k-pop\n3. \"Trap\"\n4: none\n5: drum-and-bass.";
-  assert.deepEqual([...read.lines(reply, 5)], [["1", "deep-house"], ["2", "k-pop"], ["3", "trap"], ["4", "none"], ["5", "drum-and-bass"]]);
+  assert.deepEqual([...read.lines(reply, batchOf("a", "b", "c", "d", "e"))].map(([n, v]) => [n, v.playlist]),
+    [["1", "deep-house"], ["2", "k-pop"], ["3", "trap"], ["4", "none"], ["5", "drum-and-bass"]]);
 });
 
 test("line format: answers without numbers are never matched by guesswork", async () => {
@@ -168,13 +173,23 @@ test("line format: answers without numbers are never matched by guesswork", asyn
   assert.ok(groq.requests <= 3, `stopped after ${groq.requests} requests`);
 });
 
-test("the real strict reply format from gpt-oss-120b parses, whole or cut off part-way", () => {
+test("the strict reply format parses, whole or cut off part-way, and checks each answer's song", () => {
   const read = answerReader(NODES);
-  const reply = JSON.stringify({ results: [{ n: 1, playlist: "melodic-rap" }, { n: 2, playlist: "trap" }, { n: 3, playlist: "none" }] }, null, 2);
-  assert.deepEqual([...read.json(reply, 3)], [["1", "melodic-rap"], ["2", "trap"], ["3", "none"]]);
+  const batch = batchOf("Lucid Dreams", "SICKO MODE", "Unknown Demo");
+  const reply = JSON.stringify({ results: [
+    { n: 1, w: "Lucid Dreams", p: "melodic-rap", c: "h" }, { n: 2, w: "sicko mode", p: "trap", c: "m" }, { n: 3, w: "Unknown Demo", p: "none", c: "l" },
+  ] }, null, 2);
+  assert.deepEqual([...read.json(reply, batch)], [
+    ["1", { playlist: "melodic-rap", confidence: "high" }], ["2", { playlist: "trap", confidence: "medium" }],
+    ["3", { playlist: "none", confidence: "low" }],
+  ]);
   const cut = reply.slice(0, reply.indexOf('"none"'));
-  assert.deepEqual([...read.json(cut, 3)], [["1", "melodic-rap"], ["2", "trap"]], "the half-written answer is skipped");
-  assert.deepEqual([...read.json(JSON.stringify({ results: [{ n: 9, playlist: "trap" }, { n: 1, playlist: "made-up" }] }), 3)], []);
+  assert.deepEqual([...read.json(cut, batch)].map(([n]) => n), ["1", "2"], "the half-written answer is skipped");
+  const wrongSong = JSON.stringify({ results: [{ n: 1, w: "SICKO MODE", p: "trap", c: "h" }, { n: 9, w: "x", p: "trap", c: "h" }] });
+  assert.deepEqual([...read.json(wrongSong, batch)], [], "an answer naming another song's title, or a number out of range, is dropped");
+  const sameStart = batchOf("The Bells", "The Thrill Is Gone");
+  const swapped = JSON.stringify({ results: [{ n: 1, w: "The Thrill", p: "blues", c: "h" }, { n: 2, w: "The Thrill", p: "blues", c: "h" }] });
+  assert.deepEqual([...read.json(swapped, sameStart)].map(([n]) => n), ["2"], "two words tell apart songs that both start with 'The'");
 });
 
 // ---- the free limits
@@ -255,8 +270,8 @@ test("estimates: the real library size takes about two days; nothing starts when
   const big = Array.from({ length: 6846 }, (_, i) => ({ uri: `u${i}`, title: "A Typical Song Title", artist: "Some Artist Name", featured: [] }));
   const fresh = { model: "openai/gpt-oss-120b", budget: () => ({ tpm: 6400, tpd: 180_000, dayLeft: 180_000 }) };
   const e = estimateSongJob(fresh, big, NODES);
-  assert.equal(e.days, 2);
-  assert.ok(e.startsToday && e.todayShare > 0.5);
+  assert.equal(e.days, 3, "about three days, including the careful second look");
+  assert.ok(e.startsToday && e.todayShare > 0.35);
   const spent = { ...fresh, budget: () => ({ tpm: 6400, tpd: 180_000, dayLeft: 500 }) };
   assert.equal(estimateSongJob(spent, big, NODES).startsToday, false);
 });
@@ -342,4 +357,70 @@ test("a bad key or missing model is reported clearly, and the key's real model l
   const live = ["whisper-large-v3", "openai/gpt-oss-120b", "openai/gpt-oss-safeguard-20b", "allam-2-7b", "qwen/qwen3.8-27b",
     "canopylabs/orpheus-arabic-saudi", "meta-llama/llama-prompt-guard-2-86m", "openai/gpt-oss-20b"];
   assert.equal(chooseModel(live), "openai/gpt-oss-120b");
+});
+
+// ---- confidence, the careful second look, and answers meant for another song
+
+test("answers the model meant for a neighbouring song are caught and asked again", async () => {
+  const { artists, songs } = library(40);
+  const groq = new FakeGroq({ artists });
+  groq.shiftFrom = 20; // loses its place halfway through the first batch
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const cache = {};
+  await classifySongs(client, songs, NODES, cache);
+  assert.equal(Object.keys(cache).length, 40, "every song ends up answered");
+  assertNoWrongAnswers(cache, artists, songs);
+});
+
+test("the live case: a guess from weak clues gets a careful second look with real catalog data", async () => {
+  const groq = new FakeGroq({ artists: { Logic: "conscious-rap" } });
+  groq.guesses = { "ICARUS by Tony Ann": "k-pop" };
+  groq.fromSongTags = () => "none";
+  groq.careful = {}; // the careful look only places it with the store genre:
+  const realFetch = groq.fetch;
+  groq.fetch = async (url, opts) => {
+    if (opts.body && JSON.parse(opts.body).messages[1].content.includes("Apple Music genre: Classical Crossover")) {
+      groq.careful["ICARUS by Tony Ann"] = "classical";
+    }
+    return realFetch(url, opts);
+  };
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const looked = [];
+  const cache = {};
+  await classifySongs(client, [
+    { uri: "i", title: "ICARUS", artist: "Tony Ann", featured: [] },
+    { uri: "l", title: "A Man Free", artist: "Logic", featured: [] },
+  ], NODES, cache, { moreContext: async (s) => { looked.push(s.title); return { storeGenre: "Classical Crossover" }; } });
+  assert.deepEqual(looked, ["ICARUS"], "only the unsure song is looked up");
+  assert.equal(groq.carefulRequests, 1, "one careful request, with more thinking");
+  assert.deepEqual(cache.i, { playlist: "classical", confidence: "high" });
+  assert.deepEqual(cache.l, { playlist: "conscious-rap", confidence: "medium" });
+});
+
+test("a song still unsure after the second look goes to Uncategorized, not a guessed playlist", async () => {
+  const groq = new FakeGroq();
+  groq.guesses = { "Silvershoes by Liana Flores": "latin-pop" };
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const cache = {};
+  await classifySongs(client, [{ uri: "s", title: "Silvershoes", artist: "Liana Flores", featured: [] }], NODES, cache);
+  assert.deepEqual(cache.s, { playlist: "none", confidence: "low" });
+});
+
+test("the listener's corrections are shown as examples, with the rule against judging by names", async () => {
+  const groq = new FakeGroq({ artists: { A: "pop" } });
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  await classifySongs(client, [{ uri: "a", title: "One", artist: "A", featured: [] }], NODES, {}, {
+    examples: [{ title: "Passionfruit", artist: "Drake", playlist: "contemporary-rnb" }],
+  });
+  const prompt = groq.systemPrompts[0];
+  assert.match(prompt, /placed these songs themselves[\s\S]*"Passionfruit" by Drake -> contemporary-rnb/);
+  assert.match(prompt, /all-caps title is not a sign of K-Pop/);
+  assert.match(prompt, /Spanish or Korean surname is not a sign/);
+});
+
+test("store genres and song tags reach the model as evidence", async () => {
+  const groq = new FakeGroq();
+  const { client } = setup({ groq });
+  await classifySongs(client, [{ uri: "x", title: "Icarus", artist: "Tony Ann", featured: [], storeGenre: "Classical Crossover", songTags: ["piano", "instrumental"] }], NODES, {});
+  assert.match(groq.seen[0], /listener tags for this song: piano, instrumental; Apple Music genre: Classical Crossover/);
 });

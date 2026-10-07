@@ -1,13 +1,13 @@
 {
   "_comment": "The playlists songs can be sorted into, in two levels. Each song is placed in the most specific entry that fits; a subgenre only becomes its own playlist once it has enough songs (or already exists), otherwise its songs go into the parent. 'id' is how a playlist is recognised on later runs: rename freely, but changing an id makes a new playlist. 'hint' tells the model what belongs there.",
   "genres": [
-    { "id": "pop", "name": "Pop", "hint": "mainstream pop", "sub": [
+    { "id": "pop", "name": "Pop", "hint": "mainstream pop (vocal pop songs)", "sub": [
       { "id": "dance-pop", "name": "Dance Pop", "hint": "upbeat club-leaning pop" },
       { "id": "synth-pop", "name": "Synth-Pop", "hint": "synth-driven pop, electropop, 80s-style pop" },
       { "id": "pop-ballads", "name": "Pop Ballads", "hint": "slow, emotional pop songs" }
     ]},
-    { "id": "k-pop", "name": "K-Pop", "hint": "Korean pop, idol groups, Korean R&B and hip hop" },
-    { "id": "j-pop", "name": "J-Pop", "hint": "Japanese pop and rock, anime and city pop" },
+    { "id": "k-pop", "name": "K-Pop", "hint": "pop, hip hop and R&B from the Korean music industry (idol groups, Korean soloists)" },
+    { "id": "j-pop", "name": "J-Pop", "hint": "pop and rock from the Japanese music industry, anime songs, city pop" },
     { "id": "hip-hop-rap", "name": "Hip-Hop & Rap", "hint": "hip hop and rap", "sub": [
       { "id": "trap", "name": "Trap", "hint": "trap and rage rap, 808-heavy southern-style rap" },
       { "id": "drill", "name": "Drill", "hint": "Chicago, UK and Brooklyn drill" },
@@ -53,7 +53,7 @@
     { "id": "folk-acoustic", "name": "Folk & Acoustic", "hint": "folk, singer-songwriter, Americana, acoustic" },
     { "id": "latin", "name": "Latin", "hint": "Latin music", "sub": [
       { "id": "reggaeton", "name": "Reggaeton & Latin Urban", "hint": "reggaeton, Latin trap, dembow" },
-      { "id": "latin-pop", "name": "Latin Pop", "hint": "Spanish-language pop" },
+      { "id": "latin-pop", "name": "Latin Pop", "hint": "Spanish- and Portuguese-language pop sung in those languages" },
       { "id": "regional-mexican", "name": "Regional Mexican", "hint": "corridos, banda, norteño, mariachi" },
       { "id": "tropical", "name": "Bachata & Salsa", "hint": "bachata, salsa, merengue, cumbia" },
       { "id": "brazilian", "name": "Brazilian", "hint": "funk carioca, sertanejo, MPB, bossa nova" }
@@ -64,9 +64,9 @@
     { "id": "reggae-dancehall", "name": "Reggae & Dancehall", "hint": "reggae, dancehall, soca" },
     { "id": "jazz", "name": "Jazz", "hint": "jazz" },
     { "id": "blues", "name": "Blues", "hint": "blues" },
-    { "id": "classical", "name": "Classical", "hint": "classical, opera, modern composers" },
+    { "id": "classical", "name": "Classical", "hint": "classical, opera, modern composers, solo piano, neoclassical and cinematic instrumental pieces" },
     { "id": "soundtracks", "name": "Soundtracks", "hint": "film, TV, game and musical theatre music" },
-    { "id": "chill-lo-fi", "name": "Chill & Lo-Fi", "hint": "lo-fi beats, ambient, sleep and study music" },
+    { "id": "chill-lo-fi", "name": "Chill & Lo-Fi", "hint": "lo-fi beats, ambient, instrumental chill beats, sleep and study music" },
     { "id": "christian-gospel", "name": "Christian & Gospel", "hint": "worship, gospel, Christian music" },
     { "id": "world-regional", "name": "World & Regional", "hint": "Bollywood, Punjabi, Arabic, Turkish, C-Pop, OPM and other regional music" },
     { "id": "holiday", "name": "Holiday", "hint": "Christmas and holiday songs" },

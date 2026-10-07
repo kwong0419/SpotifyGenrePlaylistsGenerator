@@ -8,8 +8,10 @@
 
 export class FakeGroq {
   /**
-   * songs: "Title by Artist" (or just "Title") -> playlist id (the model knows that song)
-   * artists: artist name -> playlist id (used for that artist's other songs)
+   * songs: "Title by Artist" (or just "Title") -> playlist id (the model knows that song: confidence high)
+   * artists: artist name -> playlist id (used for that artist's other songs: confidence medium)
+   * guesses: "Title by Artist" -> playlist id it guesses from weak clues (confidence low)
+   * careful: "Title by Artist" -> what it answers when asked to think carefully (high)
    * Anything else is answered "none".
    */
   constructor({ songs = {}, artists = {}, models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-120b"] } = {}) {
@@ -30,7 +32,14 @@ export class FakeGroq {
     this.unnumbered = false;     // line replies leave out the "N:" numbers
     this.invent = null;          // a playlist the model makes up (line format) for every answer
     this.noSchema = false;       // turn down strict structured output (400)
-    this.fromTags = null;        // (listener tags) -> playlist id, when only tags are known
+    this.fromTags = null;        // (artist listener tags) -> playlist id, when only tags are known
+    this.fromSongTags = null;    // (song listener tags) -> playlist id, on a careful look
+    this.fromStoreGenre = null;  // (Apple Music genre) -> playlist id, on a careful look
+    this.guesses = {};
+    this.careful = {};
+    this.shiftFrom = 0;          // from this song number on, answers belong to the next song
+    this.carefulRequests = 0;
+    this.systemPrompts = [];
     this.structuredRequests = 0;
     this.calls = [];             // number of songs in each completion request
     this.seen = [];              // every song line sent
@@ -40,16 +49,25 @@ export class FakeGroq {
     return { ok: status < 400, status, headers: { get: () => null }, text: async () => JSON.stringify(body) };
   }
 
-  answerFor(line) {
+  /** { playlist, confidence, word } for one song line, as the model would answer it. */
+  answerFor(line, careful) {
     const m = /^\d+\. "(.*)" by (.*?)(?: \((.*)\))?$/.exec(line);
-    if (!m) return "none";
+    if (!m) return { playlist: "none", confidence: "h", word: "" };
     const [, title, artist, extra = ""] = m;
-    if (`${title} by ${artist}` in this.songs) return this.songs[`${title} by ${artist}`];
-    if (title in this.songs) return this.songs[title];
-    if (artist in this.artists) return this.artists[artist];
+    const key = `${title} by ${artist}`;
+    const word = title.split(/\s+/).slice(0, 2).join(" ");
+    const songTags = /listener tags for this song: ([^;)]*)/.exec(extra)?.[1];
+    if (careful && key in this.careful) return { playlist: this.careful[key], confidence: "h", word };
+    if (careful && songTags && this.fromSongTags) return { playlist: this.fromSongTags(songTags), confidence: "h", word };
+    const storeGenre = /Apple Music genre: ([^;)]*)/.exec(extra)?.[1];
+    if (careful && storeGenre && this.fromStoreGenre) return { playlist: this.fromStoreGenre(storeGenre), confidence: "h", word };
+    if (key in this.songs) return { playlist: this.songs[key], confidence: "h", word };
+    if (title in this.songs) return { playlist: this.songs[title], confidence: "h", word };
+    if (artist in this.artists) return { playlist: this.artists[artist], confidence: "m", word };
+    if (key in this.guesses) return { playlist: this.guesses[key], confidence: "l", word };
     const tags = /listener tags for the artist: ([^;)]*)/.exec(extra)?.[1];
-    if (tags && this.fromTags) return this.fromTags(tags);
-    return "none";
+    if (tags && this.fromTags) return { playlist: this.fromTags(tags), confidence: "m", word };
+    return { playlist: "none", confidence: "h", word };
   }
 
   fetch = async (url, { headers, body }) => {
@@ -89,21 +107,26 @@ export class FakeGroq {
       } });
     }
     const poisoned = this.poison && lines.some((l) => l.includes(this.poison));
+    const careful = req.reasoning_effort === "medium" || /unsure about before/.test(req.messages[0].content);
+    if (careful) this.carefulRequests++;
+    this.systemPrompts.push(req.messages[0].content);
 
     const answers = [];
     lines.forEach((line, i) => {
       const n = i + 1;
       if (this.dropEvery && n % this.dropEvery === 0) return;
       if (this.skip && [...this.skip].some((t) => line.includes(`"${t}"`))) return;
-      answers.push({ n, playlist: this.answerFor(line) });
+      // Losing its place: from shiftFrom on, the model gives each number the next song's answer.
+      const source = this.shiftFrom && n >= this.shiftFrom && lines[i + 1] ? lines[i + 1] : line;
+      answers.push({ n, ...this.answerFor(source, careful) });
     });
 
     let content;
     if (structured) {
       // Constrained decoding: always this exact shape, and only ids from the schema's enum.
-      const allowed = new Set(req.response_format.json_schema.schema.properties.results.items.properties.playlist.enum);
+      const allowed = new Set(req.response_format.json_schema.schema.properties.results.items.properties.p.enum);
       const results = poisoned || this.garbleNext-- > 0 ? []
-        : answers.map((a) => ({ n: a.n, playlist: allowed.has(a.playlist) ? a.playlist : "none" }));
+        : answers.map((a) => ({ n: a.n, w: a.word, p: allowed.has(a.playlist) ? a.playlist : "none", c: a.confidence }));
       content = JSON.stringify({ results }, null, 2); // spaced out, like gpt-oss
     } else {
       content = (this.preamble || "") + answers
@@ -134,7 +157,7 @@ export class FakeGroq {
 
 /** How the simulated model sorts the demo library (see demoLibrary in fake-spotify.mjs). */
 export function demoGroq() {
-  return new FakeGroq({
+  const groq = new FakeGroq({
     artists: {
       "Kendrick Lamar": "conscious-rap",
       "Phoebe Bridgers": "indie-pop",
@@ -157,4 +180,9 @@ export function demoGroq() {
       "Paper Planes by Taylor Swift": "pop-ballads",
     },
   });
+  // A song it only half-knows: guessed with low confidence, then placed on the careful
+  // second look from Apple Music's genre for it.
+  groq.guesses = { "Midnight by Small Local Band": "k-pop" };
+  groq.fromStoreGenre = (genre) => (genre === "Singer/Songwriter" ? "folk-acoustic" : "none");
+  return groq;
 }
