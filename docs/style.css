@@ -155,3 +155,8 @@ select { font: inherit; color: var(--text); background: var(--bg); border: 1px s
 
 a.secondary-link { display: inline-block; padding: 9px 18px; border: 1px solid var(--line); border-radius: 999px; color: var(--text); text-decoration: none; }
 a.secondary-link:hover { background: var(--bg); }
+
+.songs li { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.songs li > span { min-width: 0; }
+.songs .mine { color: var(--accent); font-size: .8rem; white-space: nowrap; }
+select.move { flex: 0 0 auto; width: 9.5rem; padding: 3px 6px; font-size: .8rem; }
