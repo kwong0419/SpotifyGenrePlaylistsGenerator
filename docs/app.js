@@ -4,7 +4,7 @@ import {
   resolvePlaylists, syncPlaylists, planSync, SpotifyError, RateLimitedError, UNCATEGORIZED, NOT_SORTED_YET,
 } from "./core.js";
 import {
-  createGroq, chooseModel, chatModels, clearUsageEstimates, classifySongs, estimateSongJob, firstWord,
+  createGroq, chooseModel, chatModels, clearUsageEstimates, classifySongs, estimateSongJob, firstWord, supportsStrictOutput,
   GroqError, GroqDailyLimitError, PREFERRED_MODELS,
 } from "./groq.js";
 
@@ -259,6 +259,7 @@ async function saveGroqKey() {
     if (!model) throw new Error("This Groq key has no text models available.");
     store.set("groqKey", key);
     store.set("groqModel", model);
+    store.set("groqModels", models);
     scan();
   } catch (err) {
     showGroqSetup(err instanceof GroqError && err.kind === "auth"
@@ -441,32 +442,41 @@ async function scanLibrary() {
     return { storeGenre: storeGenreCache[song.uri] || "", songTags: songTagCache[song.uri] || [] };
   };
   let paused = null;
+  let groqInUse = groq;
+  state.runStats = [];
 
   try {
     const todo = tracks.filter((t) => !(t.uri in answers) && !(t.uri in corrections)).map(toSong);
     const rechecking = todo.filter((x) => x.uri in previous).length;
-    const estimate = estimateSongJob(groq, todo, state.nodes);
+    const estimate = estimateSongJob(await combinedBudget(groq), todo, state.nodes);
     // If nothing fits today, skip the plan: classifySongs stops before sending anything and
     // the allowance screen offers the ways forward (check with Groq, another model).
     if (todo.length && estimate.startsToday && (estimate.minutes >= 3 || estimate.days > 1)) {
       await confirmPlan(estimate, todo.length, tracks.length - todo.length, rechecking);
     }
     const startedAt = Date.now();
-    const line = liveProgress(rechecking ? "Re-checking your songs…" : "Sorting your songs…", "songs", estimate.minutes * 60000, STEPS.sort);
+    const verb = rechecking ? "Re-checking your songs" : "Sorting your songs";
     try {
-      await classifySongs(groq, todo, state.nodes, answers, {
-        examples, moreContext,
-        onProgress: (done, total) => line.update(done, total),
-        onSaved: (c) => saveThrottled("songAnswers", c),
-        onLookup: (i, n) => {
+      groqInUse = await withModelFallback(groq, async (client, switched) => {
+        const line = liveProgress(`${verb}${switched ? ` with ${shortModel(client.model)}` : ""}…`, "songs",
+          estimate.minutes * 60000, STEPS.sort);
+        try {
+          await classifySongs(client, todo, state.nodes, answers, {
+            examples, moreContext,
+            onProgress: (done, total) => line.update(done, total),
+            onSaved: (c) => saveThrottled("songAnswers", c),
+            onLookup: (i, n) => {
+              line.stop();
+              progress("Looking up songs Groq was unsure about…", i, n,
+                `${i.toLocaleString()} of ${n.toLocaleString()} songs · checking Apple Music${lastfmKey ? " and Last.fm" : ""} `
+                + `· about ${minutesText((n - i) * 3100)} left`, STEPS.sort);
+            },
+          });
+        } finally {
           line.stop();
-          progress("Looking up songs Groq was unsure about…", i, n,
-            `${i.toLocaleString()} of ${n.toLocaleString()} songs · checking Apple Music${lastfmKey ? " and Last.fm" : ""} `
-            + `· about ${minutesText((n - i) * 3100)} left`, STEPS.sort);
-        },
+        }
       });
     } finally {
-      line.stop();
       saveThrottled("songAnswers", answers, true);
     }
 
@@ -494,13 +504,13 @@ async function scanLibrary() {
       store.set("lastfmTried", [...tried]);
       if (retry.length) {
         const again = liveProgress("Sorting songs again with Last.fm's tags…", "songs",
-          ((retry.length * 30) / groq.budget().tpm) * 60000, STEPS.sort);
+          ((retry.length * 30) / groqInUse.budget().tpm) * 60000, STEPS.sort);
         try {
-          await classifySongs(groq, retry.map(toSong), state.nodes, answers, {
+          groqInUse = await withModelFallback(groqInUse, (client) => classifySongs(client, retry.map(toSong), state.nodes, answers, {
             examples, moreContext,
             onProgress: (done, total) => again.update(done, total),
             onSaved: (c) => saveThrottled("songAnswers", c),
-          });
+          }));
         } finally {
           again.stop();
         }
@@ -512,6 +522,8 @@ async function scanLibrary() {
     paused = err;
   } finally {
     saveThrottled("songAnswers", answers, true);
+    // What happened, per model, for diagnosing (requests, tokens, cut-offs, rejected answers).
+    store.set("groqStats", { at: Date.now(), runs: state.runStats });
   }
   // Once every song has a checked answer (or a correction), the old placements aren't needed.
   if (tracks.every((t) => t.uri in answers || t.uri in corrections)) store.del("songPicks");
@@ -530,6 +542,12 @@ async function scanLibrary() {
     return groupSongs(tracks, picks, state.nodes, { isPending: (t) => !(t.uri in picks), keepIds });
   };
   state.groups = state.regroup(new Set(Object.keys(store.get("playlists", {}))));
+  // Which models sorted the songs (more than one when one's allowance ran out mid-run).
+  state.byModel = new Map();
+  for (const t of tracks) {
+    const m = !(t.uri in corrections) && answers[t.uri]?.model;
+    if (m) state.byModel.set(m, (state.byModel.get(m) || 0) + 1);
+  }
   // Songs still placed by the previous method, waiting to be re-checked.
   state.awaitingRecheck = tracks.filter((t) => !(t.uri in answers) && !(t.uri in corrections) && t.uri in previous).length;
   state.leftover = {
@@ -544,6 +562,63 @@ async function scanLibrary() {
   if (!paused) store.del("groqDays"); // fully sorted: a future multi-day run starts at day 1
   if (paused) return showGroqPaused(paused);
   return showPreview();
+}
+
+const shortModel = (m) => String(m).replace(/^openai\//, "");
+
+/**
+ * Runs `task(client, switched)` with the user's model, and if that model's free daily
+ * allowance runs out, carries on with the next model the key can use (each model has its
+ * own allowance on the account), until the work is done or every model is used up.
+ * Only models with strict structured output are used, so answers stay checkable.
+ * Returns the client that finished; throws the last GroqDailyLimitError otherwise.
+ * Turned off in Settings, it only ever uses the chosen model.
+ */
+/** The user's model, then (if allowed in Settings) the other strict-mode models the key has. */
+async function modelChain(primary) {
+  const chain = [primary.model];
+  if (!store.get("autoSwitch", true)) return chain;
+  let available = store.get("groqModels", null);
+  if (!available) {
+    try { available = await primary.listModels(); store.set("groqModels", available); } catch { available = []; }
+  }
+  for (const m of [...PREFERRED_MODELS, ...chatModels(available)]) {
+    if (available.includes(m) && supportsStrictOutput(m) && !chain.includes(m)) chain.push(m);
+  }
+  return chain;
+}
+
+/** For estimates: the allowances of every model the run can use, added together. */
+async function combinedBudget(primary) {
+  const clients = (await modelChain(primary)).map((m, i) => (i === 0 ? primary : groqClient(undefined, m)));
+  const budgets = clients.map((c) => c.budget());
+  return {
+    model: primary.model,
+    budget: () => ({
+      tpm: budgets[0].tpm,
+      tpd: budgets.reduce((n, b) => n + b.tpd, 0),
+      dayLeft: budgets.reduce((n, b) => n + b.dayLeft, 0),
+    }),
+  };
+}
+
+async function withModelFallback(primary, task) {
+  const chain = await modelChain(primary);
+  let last = null;
+  for (const [i, model] of chain.entries()) {
+    const client = i === 0 ? primary : groqClient(undefined, model);
+    try {
+      await task(client, i > 0);
+      state.runStats.push({ model, ...client.stats });
+      return client;
+    } catch (err) {
+      state.runStats.push({ model, ...client.stats });
+      if (!(err instanceof GroqDailyLimitError)) throw err;
+      last = err;
+      state.modelsUsedUp = [...(state.modelsUsedUp || []), model];
+    }
+  }
+  throw last;
 }
 
 /** Saved data from versions that sorted by artist; none of it is used any more. */
@@ -605,6 +680,13 @@ function showGroqPaused(err) {
   $("budget-when").textContent = err.source === "groq"
     ? `Groq says ${model}'s allowance resets after ${formatWhen(err.resumeAt)}. Open this page again then and it continues where it stopped.`
     : `By the app's count, ${model}'s allowance frees up after ${formatWhen(err.resumeAt)}. Open this page again then and it continues where it stopped.`;
+  $("budget-detail").textContent = err.detail ? `Groq said: "${err.detail.replace(/\s+/g, " ").slice(0, 300)}"` : "";
+  $("budget-detail").hidden = !err.detail;
+  const usedUp = state.modelsUsedUp || [];
+  if (usedUp.length > 1) {
+    $("budget-title").textContent = "Today's free allowances are used up";
+    $("budget-lead").textContent = `${usedUp.map(shortModel).join(" and ")} both reached their daily limit. Everything sorted so far is saved.`;
+  }
   $("budget-check-box").hidden = err.source !== "estimate";
   $("budget-continue-box").hidden = sortedSongs === 0;
   document.title = `Paused until ${formatWhen(err.resumeAt)} — ${APP_TITLE}`;
@@ -707,6 +789,9 @@ function renderPreview() {
     parts.push(`${uncategorized.toLocaleString()} song${uncategorized === 1 ? "" : "s"} Groq couldn't place`
       + (unsure ? `, including ${unsure.toLocaleString()} it wasn't sure enough about to put in a playlist` : "")
       + `${state.leftover?.hasLastfm ? "" : " (a free Last.fm key in Settings can help with these)"}. You can move any song yourself.`);
+  }
+  if (state.byModel?.size > 1) {
+    parts.push(`Sorted by ${[...state.byModel].map(([m, n]) => `${shortModel(m)} (${n.toLocaleString()})`).join(" and ")}.`);
   }
   if (state.awaitingRecheck) {
     parts.push(`${state.awaitingRecheck.toLocaleString()} song${state.awaitingRecheck === 1 ? " is" : "s are"} still in their previous `
@@ -1013,6 +1098,7 @@ function openSettings() {
   $("opt-lastfm").value = store.get("lastfm", "");
   $("opt-groq-key").value = store.get("groqKey", "");
   $("opt-groq-model").value = store.get("groqModel", PREFERRED_MODELS[0]);
+  $("opt-auto-switch").checked = store.get("autoSwitch", true);
   const own = store.get("clientId");
   $("app-source").textContent = own
     ? `Using your own Spotify app (Client ID …${own.slice(-4)}).`
@@ -1029,8 +1115,10 @@ function saveSettings() {
   const groqKey = $("opt-groq-key").value.trim();
   const groqModel = $("opt-groq-model").value.trim() || PREFERRED_MODELS[0];
   const groqChanged = groqKey !== store.get("groqKey", "") || groqModel !== store.get("groqModel", PREFERRED_MODELS[0]);
+  if (groqKey !== store.get("groqKey", "")) store.del("groqModels"); // a new key may offer other models
   store.set("groqKey", groqKey);
   store.set("groqModel", groqModel);
+  store.set("autoSwitch", $("opt-auto-switch").checked);
   if (!$("screen-preview").hidden) {
     if (store.get("lastfm", "") !== lastfmBefore || groqChanged) scan();
     else showPreview();
