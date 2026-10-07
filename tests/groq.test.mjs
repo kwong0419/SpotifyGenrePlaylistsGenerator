@@ -65,10 +65,10 @@ test("songs are sorted in batches, saved, and never sent twice", async () => {
   const cache = {};
   await classifySongs(client, songs, NODES, cache);
   assert.equal(Object.keys(cache).length, 200);
-  assert.deepEqual(groq.calls, [80, 80, 40]);
+  assert.deepEqual(groq.calls, [60, 60, 60, 20]);
   assertNoWrongAnswers(cache, artists, songs);
   await classifySongs(client, songs, NODES, cache);
-  assert.equal(groq.requests, 3, "a second run sends nothing");
+  assert.equal(groq.requests, 4, "a second run sends nothing");
 });
 
 test("a song the model doesn't know is saved as 'none'", async () => {
@@ -266,12 +266,12 @@ test("'check with Groq' clears our own count but never a limit Groq itself gave"
   assert.equal(t.groq.requests, 0, "nothing sent while Groq's own block lasts");
 });
 
-test("estimates: the real library size takes about two days; nothing starts when no request fits today", () => {
+test("estimates: the real library size takes about four days on one model; nothing starts when no request fits today", () => {
   const big = Array.from({ length: 6846 }, (_, i) => ({ uri: `u${i}`, title: "A Typical Song Title", artist: "Some Artist Name", featured: [] }));
   const fresh = { model: "openai/gpt-oss-120b", budget: () => ({ tpm: 6400, tpd: 180_000, dayLeft: 180_000 }) };
   const e = estimateSongJob(fresh, big, NODES);
-  assert.equal(e.days, 3, "about three days, including the careful second look");
-  assert.ok(e.startsToday && e.todayShare > 0.35);
+  assert.equal(e.days, 4, "measured cost per song, including the careful second look");
+  assert.ok(e.startsToday && e.todayShare > 0.25);
   const spent = { ...fresh, budget: () => ({ tpm: 6400, tpd: 180_000, dayLeft: 500 }) };
   assert.equal(estimateSongJob(spent, big, NODES).startsToday, false);
 });
@@ -393,8 +393,8 @@ test("the live case: a guess from weak clues gets a careful second look with rea
   ], NODES, cache, { moreContext: async (s) => { looked.push(s.title); return { storeGenre: "Classical Crossover" }; } });
   assert.deepEqual(looked, ["ICARUS"], "only the unsure song is looked up");
   assert.equal(groq.carefulRequests, 1, "one careful request, with more thinking");
-  assert.deepEqual(cache.i, { playlist: "classical", confidence: "high" });
-  assert.deepEqual(cache.l, { playlist: "conscious-rap", confidence: "medium" });
+  assert.deepEqual(cache.i, { playlist: "classical", confidence: "high", model: "openai/gpt-oss-120b" });
+  assert.deepEqual(cache.l, { playlist: "conscious-rap", confidence: "medium", model: "openai/gpt-oss-120b" });
 });
 
 test("a song still unsure after the second look goes to Uncategorized, not a guessed playlist", async () => {
@@ -403,7 +403,7 @@ test("a song still unsure after the second look goes to Uncategorized, not a gue
   const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
   const cache = {};
   await classifySongs(client, [{ uri: "s", title: "Silvershoes", artist: "Liana Flores", featured: [] }], NODES, cache);
-  assert.deepEqual(cache.s, { playlist: "none", confidence: "low" });
+  assert.deepEqual(cache.s, { playlist: "none", confidence: "low", model: "openai/gpt-oss-120b" });
 });
 
 test("the listener's corrections are shown as examples, with the rule against judging by names", async () => {
@@ -423,4 +423,56 @@ test("store genres and song tags reach the model as evidence", async () => {
   const { client } = setup({ groq });
   await classifySongs(client, [{ uri: "x", title: "Icarus", artist: "Tony Ann", featured: [], storeGenre: "Classical Crossover", songTags: ["piano", "instrumental"] }], NODES, {});
   assert.match(groq.seen[0], /listener tags for this song: piano, instrumental; Apple Music genre: Classical Crossover/);
+});
+
+// ---- fewer wasted requests
+
+test("titles with apostrophes, dots, '&' or a leading bracket are matched; real mismatches still aren't", () => {
+  const read = answerReader(NODES);
+  const one = (title, w) => read.json(JSON.stringify({ results: [{ n: 1, w, p: "pop", c: "h" }] }), batchOf(title)).size === 1;
+  for (const [title, w] of [["Don't Start Now", "Dont Start"], ["Ain't No Mountain High Enough", "Aint No"], ["P.Y.T. (Pretty Young Thing)", "PYT Pretty"],
+    ["Rock & Roll", "Rock and"], ["Rock & Roll", "Rock Roll"], ["(I Can't Get No) Satisfaction", "Satisfaction"], ["Él Me Mintió", "El Me"], ["7/11", "7 11"]]) {
+    assert.ok(one(title, w), `${title} <- ${w}`);
+  }
+  for (const [title, w] of [["The Bells", "The Thrill"], ["Song 12", "Song 13"], ["Love Story", "Love Me"], ["The Bells", "The"]]) {
+    assert.ok(!one(title, w), `${title} <- ${w} should be rejected`);
+  }
+});
+
+test("a library full of punctuated titles is sorted without wasted re-asks", async () => {
+  const titles = ["Don't Start Now", "Ain't No Sunshine", "P.Y.T. (Pretty Young Thing)", "Rock & Roll", "Mr. Brightside", "(I Can't Get No) Satisfaction"];
+  const songs = Array.from({ length: 60 }, (_, i) => ({ uri: `p${i}`, title: `${titles[i % titles.length]}`, artist: `Band ${i}`, featured: [] }));
+  const artists = Object.fromEntries(songs.map((x) => [x.artist, "classic-rock"]));
+  const groq = new FakeGroq({ artists });
+  // Like gpt-oss: echoes titles without their punctuation.
+  groq.echo = (title) => title.replace(/[.']/g, "").replace(/[()&]/g, " ").replace(/\s+/g, " ").trim().split(" ").slice(0, 2).join(" ");
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const cache = {};
+  await classifySongs(client, songs, NODES, cache);
+  assert.equal(Object.keys(cache).length, 60);
+  assert.equal(groq.requests, 1, "one request for the whole batch");
+  assert.equal(client.stats.rejected, 0);
+});
+
+test("Groq's own refusal message is kept, and its real daily limit is learned", async () => {
+  const { artists, songs } = library(200);
+  const s = setup({ groq: new FakeGroq({ artists }) });
+  s.groq.dailyLimit = 3000;
+  const err = await classifySongs(s.client, songs, NODES, {}).catch((e) => e);
+  assert.ok(err instanceof GroqDailyLimitError);
+  assert.match(err.detail, /tokens per day \(TPD\): Limit 3000/);
+  assert.ok(s.entries().some((e) => e.limitTpd === 3000), "the real limit is remembered");
+  const again = createGroq({ apiKey: "k", model: "llama-3.3-70b-versatile", fetchImpl: s.groq.fetch, ledger: s.ledger });
+  assert.equal(again.budget().tpd, 2700, "later budgeting uses 90% of Groq's real limit");
+});
+
+test("the counters show what happened: requests, cut-offs, rejected answers, splits", async () => {
+  const { artists, songs } = library(60);
+  const groq = new FakeGroq({ artists });
+  groq.shiftFrom = 30;
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  await classifySongs(client, songs, NODES, {});
+  assert.ok(client.stats.requests >= 2);
+  assert.ok(client.stats.rejected >= 30, `answers meant for neighbours were counted: ${client.stats.rejected}`);
+  assert.ok(client.stats.tokens > 0);
 });

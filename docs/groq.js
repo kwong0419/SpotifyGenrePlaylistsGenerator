@@ -49,10 +49,11 @@ export class GroqDailyLimitError extends Error {
    * source "estimate": our own count of today's usage says we're at the safe limit; Groq
    * may still have some left, so it's fine to ask (see clearUsageEstimates).
    */
-  constructor(resumeAt, source = "groq") {
+  constructor(resumeAt, source = "groq", detail = "") {
     super("Groq's free daily allowance is used up for now.");
     this.resumeAt = resumeAt;
     this.source = source;
+    this.detail = detail; // Groq's own message, e.g. "...tokens per day (TPD): Limit 200000, Used 199850..."
   }
 }
 
@@ -72,8 +73,10 @@ export const estimateTokens = (text) => Math.ceil(text.length / 3.5);
  * thinking and reply with nothing. So they're asked to think briefly, and get extra room.
  */
 export const isReasoningModel = (model) => /gpt-oss|qwen3|qwq|deepseek-r1|reason/i.test(model || "");
-export const REASONING_ROOM = 1024;
-const CAREFUL_REASONING_ROOM = 2048; // for reasoning_effort "medium"
+// Room for a reasoning model's thinking, which counts against max_tokens. Measured on real
+// runs: low effort over a batch of 60 songs thinks for up to ~1,500 tokens.
+export const REASONING_ROOM = 1536;
+const CAREFUL_REASONING_ROOM = 3072; // for reasoning_effort "medium"
 
 /** "Please try again in 1h2m3.5s" -> ms */
 function parseTryAgain(message) {
@@ -91,6 +94,12 @@ export function createGroq({
   ledger, onWait = () => {}, onPace = () => {}, limits,
 }) {
   let lim = { ...(limits || MODEL_LIMITS[model] || UNKNOWN_MODEL_LIMITS) };
+  // A daily limit Groq itself reported (see the 429 handling) beats our table.
+  const learned = (ledger.load() || []).filter((e) => e.limitTpd && e.t > now() - 7 * DAY).pop();
+  if (learned) lim.tpd = learned.limitTpd;
+  // What happened this session, for diagnosing: requests, tokens, cut-off replies, answers
+  // rejected as belonging to another song, batches split in half.
+  const stats = { requests: 0, tokens: 0, cutOffs: 0, rejected: 0, splits: 0 };
   const caps = () => ({
     tpm: Math.floor(lim.tpm * 0.8), rpm: Math.floor(lim.rpm * 0.8),
     tpd: Math.floor(lim.tpd * 0.9), rpd: Math.floor(lim.rpd * 0.9),
@@ -106,7 +115,7 @@ export function createGroq({
     ledger.save(list);
   }
   function usage() {
-    const list = entries().filter((e) => e.t);
+    const list = entries().filter((e) => e.t && typeof e.tokens === "number");
     const minute = list.filter((e) => e.t > now() - 60_000);
     return {
       day: list.reduce((n, e) => n + e.tokens, 0), dayRequests: list.length,
@@ -130,7 +139,7 @@ export function createGroq({
 
   async function waitForBudget(estimated) {
     const blocked = entries().find((e) => e.blockedUntil > now());
-    if (blocked) throw new GroqDailyLimitError(blocked.blockedUntil, "groq");
+    if (blocked) throw new GroqDailyLimitError(blocked.blockedUntil, "groq", blocked.message || "");
     const c = caps();
     // Bigger than a whole minute's allowance: can never be sent, so make the caller split it.
     if (estimated > c.tpm) throw new GroqError("too_large", "Batch is larger than the per-minute allowance");
@@ -198,9 +207,12 @@ export function createGroq({
         const wait = parseTryAgain(message) ?? (retryAfter > 0 ? retryAfter * 1000 : 20_000);
         if (/per day|\(TPD\)|\(RPD\)/i.test(message) || wait > 10 * 60_000) {
           const list = entries();
-          list.push({ blockedUntil: now() + wait + 5000 });
+          list.push({ blockedUntil: now() + wait + 5000, message });
+          // Groq says what the limit actually is ("tokens per day (TPD): Limit 200000"): remember it.
+          const tpd = /tokens per day \(TPD\): Limit (\d+)/i.exec(message)?.[1];
+          if (tpd) { list.push({ t: now(), limitTpd: +tpd }); lim.tpd = +tpd; }
           ledger.save(list);
-          throw new GroqDailyLimitError(now() + wait + 5000, "groq");
+          throw new GroqDailyLimitError(now() + wait + 5000, "groq", message);
         }
         if (++rateLimited > 3) throw new GroqError("busy", "Groq keeps asking us to slow down. Try again in a few minutes.");
         onWait(wait + 1000);
@@ -214,6 +226,7 @@ export function createGroq({
 
   return {
     get model() { return model; },
+    stats,
     /** Ids of the chat models this key can use. Also confirms the key works (free: no tokens used). */
     async listModels() {
       const data = await call("/models");
@@ -242,9 +255,13 @@ export function createGroq({
         throw err;
       }
       record(data?.usage?.total_tokens ?? estimated);
+      stats.requests++;
+      stats.tokens += data?.usage?.total_tokens ?? estimated;
       const text = data?.choices?.[0]?.message?.content;
       if (typeof text !== "string") throw new GroqError("bad_output", "Groq's reply had no text");
-      return { text, cutOff: data.choices[0].finish_reason === "length" };
+      const cutOff = data.choices[0].finish_reason === "length";
+      if (cutOff) stats.cutOffs++;
+      return { text, cutOff };
     },
     /** For progress messages: rough tokens/minute we allow ourselves, and what's left today. */
     budget() {
@@ -274,11 +291,13 @@ const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 // is ~20 tokens as the model spaces it out (short keys keep every answer cheap); a line
 // "37: classical" ~6. Room is generous so replies are rarely cut off, and a cut-off reply
 // still yields its complete answers.
-const ROOM = { json: 34, lines: 10 };
-const TYPICAL = { json: 22, lines: 6 };
+// Measured on real runs: gpt-oss spaces answers over several lines, ~28 tokens each.
+const ROOM = { json: 40, lines: 10 };
+const TYPICAL = { json: 28, lines: 6 };
 // The playlist list is ~1,100 tokens per request, so bigger batches waste less on repeating
-// it; 80 songs keeps a request (with its reply room) under gpt-oss-120b's per-minute cap.
-const SONG_BATCH = 80;
+// it; 60 songs keeps a request (with its reply and thinking room) under gpt-oss-120b's
+// per-minute cap, so replies aren't cut off and re-asked.
+const SONG_BATCH = 60;
 // Songs the model was unsure about get a second, more careful look in smaller batches.
 const CAREFUL_BATCH = 30;
 const MAX_EXAMPLES = 20;
@@ -305,7 +324,7 @@ Confidence: "h" (high) if you know the song, or the artist's sound well enough t
 }
 
 const FORMAT = {
-  json: "Give exactly one result per numbered song: n = its number, w = the first two words of its title (or its only word), p = the playlist id, c = your confidence.",
+  json: "Give exactly one result per numbered song: n = its number, w = the first two words of its title (or its only word), p = the playlist id, c = your confidence. Write the JSON compactly on one line.",
   lines: "Reply with exactly one line per song, starting with its number, and nothing else, e.g.\n1: deep-house\n2: none",
 };
 
@@ -321,6 +340,9 @@ const songLine = (s) => {
 /** The words of a title, simplified for comparing ("Don't Stop" -> ["don", "t", "stop"]). */
 const words = (text) => String(text ?? "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
   .toLowerCase().match(/[\p{L}\p{N}]+/gu) || [];
+/** A title simplified to its letters and digits, for comparing ("Don't Stop" -> "dontstop"). */
+const letters = (text) => String(text ?? "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+  .replace(/&/g, "and").replace(/[^\p{L}\p{N}]+/gu, "");
 /** The first word of a title ("Don't Stop" -> "don"). */
 export const firstWord = (text) => words(text)[0] || "";
 
@@ -328,7 +350,7 @@ export const firstWord = (text) => words(text)[0] || "";
  * Reading answers into Map(n -> { playlist, confidence }). Only a real playlist id (or its
  * exact name, or "none") is accepted: strict mode can't produce anything else, and in the
  * line format anything else is ignored and asked again. In structured answers the echoed
- * first two words of the title must match the song with that number; if they don't, the answer
+ * start of the title must match the song with that number; if it doesn't, the answer
  * was meant for a different song and is dropped (the song is asked again). Numbers outside
  * the batch are ignored, and the first answer for a number wins.
  */
@@ -338,14 +360,19 @@ export function answerReader(nodes) {
     const k = String(v ?? "").trim().replace(/^["'`*]+|["'`*.]+$/g, "").toLowerCase();
     return k === "none" ? "none" : lookup.get(k) || null;
   };
-  // The answer must repeat the title's first two words (or its only word): one word alone
-  // can't tell apart neighbouring songs that both start with "The" or "Love".
+  // The answer must repeat the start of the title (its first two words): one word alone
+  // can't tell apart neighbouring songs that both start with "The" or "Love". Compared on
+  // letters and digits only, so "Don't Start" = "Dont Start", "P.Y.T." = "PYT", "&" = "and",
+  // and a leading "(I Can't Get No)" may be skipped. Real mismatches still fail.
   const sameWord = (given, title) => {
-    const want = words(title).slice(0, 2);
-    const got = words(given).slice(0, 2);
-    if (!want.length) return true;
-    if (got.length < want.length) return false;
-    return want.every((w, i) => got[i] === w || w.startsWith(got[i]) || got[i].startsWith(w));
+    const got = letters(given);
+    const t = String(title);
+    const unbracketed = t.replace(/^\s*[([][^)\]]*[)\]]\s*/, "");
+    // "&" may be echoed as "and" or left out altogether.
+    const starts = [t, unbracketed, t.replace(/&/g, " "), unbracketed.replace(/&/g, " ")].map(letters);
+    if (!starts[0]) return true;
+    return starts.some((want) => want && got.length >= Math.min(4, want.length)
+      && (want.startsWith(got) || got.startsWith(want)));
   };
   const json = (text, batch) => {
     const out = new Map();
@@ -354,7 +381,7 @@ export function answerReader(nodes) {
       const k = String(n);
       const song = batch[+n - 1];
       if (!v || !Number.isInteger(+n) || !song || out.has(k)) return;
-      if (!sameWord(word, song.title)) return; // meant for another song
+      if (!sameWord(word, song.title)) { out.rejected = (out.rejected || 0) + 1; return; } // meant for another song
       out.set(k, { playlist: v, confidence: ["high", "medium", "low"].includes(confidence) ? confidence : "medium" });
     };
     const CONFIDENCE = { h: "high", m: "medium", l: "low" };
@@ -412,12 +439,12 @@ const answerSchema = (nodes) => ({
 export function estimateSongJob(groq, songs, nodes, batchSize = SONG_BATCH) {
   const mode = modeFor(groq.model);
   const reasoning = isReasoningModel(groq.model);
-  const perBatch = estimateTokens(`${sortingTask(nodes)}\n${FORMAT[mode]}`) + 40 + (reasoning ? 300 : 0);
+  const perBatch = estimateTokens(`${sortingTask(nodes)}\n${FORMAT[mode]}`) + 40 + (reasoning ? 900 : 0);
   const perSong = (s) => estimateTokens(songLine(s)) + 3 + TYPICAL[mode];
   const main = songs.reduce((n, s) => n + perSong(s), 0) + Math.ceil(songs.length / batchSize) * perBatch;
   const unsure = Math.ceil(songs.length * 0.1);
   const second = mode === "json"
-    ? unsure * (perSong({ title: "a typical song", artist: "an artist" }) + 15) + Math.ceil(unsure / CAREFUL_BATCH) * (perBatch + (reasoning ? 600 : 0))
+    ? unsure * (perSong({ title: "a typical song", artist: "an artist" }) + 15) + Math.ceil(unsure / CAREFUL_BATCH) * (perBatch + (reasoning ? 1500 : 0))
     : 0;
   const tokens = main + second;
   const { tpm, tpd, dayLeft } = groq.budget();
@@ -461,7 +488,7 @@ export async function classifySongs(groq, songs, nodes, cache, {
   const save = (results, careful) => {
     for (const [uri, a] of Object.entries(results)) {
       if (a.confidence === "low" && !careful) { unsure.push(uri); continue; }
-      cache[uri] = a.confidence === "low" ? { playlist: "none", confidence: "low" } : a;
+      cache[uri] = { ...(a.confidence === "low" ? { playlist: "none", confidence: "low" } : a), model: groq.model };
       done++;
     }
     onSaved(cache);
@@ -518,6 +545,7 @@ async function runBatches(groq, items, { spec, line, key, batchSize, onBatch }) 
       const answers = mode === "json"
         ? spec.parseJson(reply.text, batch)
         : spec.parseLines(reply.text, batch, reply.cutOff);
+      if (groq.stats) groq.stats.rejected += answers.rejected || 0;
       return { answers, text: reply.text };
     } catch (err) {
       if (err instanceof GroqError && err.kind === "no_schema" && mode === "json") {
@@ -543,6 +571,7 @@ async function runBatches(groq, items, { spec, line, key, batchSize, onBatch }) 
 
   async function split(batch, retries) {
     if (batch.length < 2) return; // a single item with no usable answer: left for next run
+    if (groq.stats) groq.stats.splits++;
     const mid = Math.ceil(batch.length / 2);
     await attempt(batch.slice(0, mid), retries);
     await attempt(batch.slice(mid), retries);

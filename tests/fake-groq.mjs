@@ -22,6 +22,8 @@ export class FakeGroq {
     this.tokensUsed = 0;
     this.requests = 0;
     this.dailyLimit = Infinity;  // tokens; going past it gives a per-day 429
+    this.dailyLimits = {};       // model -> its own daily limit (each model has its own allowance)
+    this.usedByModel = {};
     this.minuteLimitNext = 0;    // next N completions get a per-minute 429
     this.garbleNext = 0;         // next N completions reply with prose instead of answers
     this.preamble = "";          // text the model adds before its answers (line format)
@@ -55,7 +57,7 @@ export class FakeGroq {
     if (!m) return { playlist: "none", confidence: "h", word: "" };
     const [, title, artist, extra = ""] = m;
     const key = `${title} by ${artist}`;
-    const word = title.split(/\s+/).slice(0, 2).join(" ");
+    const word = this.echo ? this.echo(title) : title.split(/\s+/).slice(0, 2).join(" ");
     const songTags = /listener tags for this song: ([^;)]*)/.exec(extra)?.[1];
     if (careful && key in this.careful) return { playlist: this.careful[key], confidence: "h", word };
     if (careful && songTags && this.fromSongTags) return { playlist: this.fromSongTags(songTags), confidence: "h", word };
@@ -81,8 +83,10 @@ export class FakeGroq {
     }
     const prompt = req.messages.map((m) => m.content).join("\n");
     const promptTokens = Math.ceil(prompt.length / 3.5);
-    if (this.tokensUsed + promptTokens > this.dailyLimit) {
-      return this.reply(429, { error: { message: `Rate limit reached for model \`${req.model}\` on tokens per day (TPD): Limit ${this.dailyLimit}, Used ${this.tokensUsed}. Please try again in 7h12m5.2s.`, type: "tokens" } });
+    const limit = this.dailyLimits[req.model] ?? this.dailyLimit;
+    const used = req.model in this.dailyLimits ? (this.usedByModel[req.model] || 0) : this.tokensUsed;
+    if (used + promptTokens > limit) {
+      return this.reply(429, { error: { message: `Rate limit reached for model \`${req.model}\` on tokens per day (TPD): Limit ${limit}, Used ${used}. Please try again in 7h12m5.2s.`, type: "tokens" } });
     }
     if (this.minuteLimitNext > 0) {
       this.minuteLimitNext--;
@@ -148,6 +152,7 @@ export class FakeGroq {
     }
     const completionTokens = Math.ceil(content.length / 3.5) + Math.min(thinking, req.max_tokens);
     this.tokensUsed += promptTokens + completionTokens;
+    this.usedByModel[req.model] = (this.usedByModel[req.model] || 0) + promptTokens + completionTokens;
     return this.reply(200, {
       choices: [{ message: { content }, finish_reason: finish }],
       usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
