@@ -46,10 +46,11 @@ Groq replies use [strict structured outputs](https://console.groq.com/docs/struc
 the model supports them, so the answer can only be a real playlist from the list; other models answer
 in numbered lines, and anything that isn't a real playlist is ignored and asked again.
 
-Answers are saved in your browser, so later runs only send newly liked songs. Each Groq model has its
-own free daily allowance, so when one runs out the app carries on with the next strict-mode model your
-key has (e.g. `gpt-oss-120b`, then `gpt-oss-20b`; turn this off in Settings). Sorting a 7,000-song
-library the first time takes about two days that way; you can make playlists from what's sorted on
+Answers are saved in your browser, so later runs only send newly liked songs. When the model's free
+daily allowance runs out, the app stops and asks: wait for it to reset, make playlists from what's
+sorted, or carry on with another model (each Groq model has its own allowance; smaller ones are less
+accurate). A model picked there is only used until your usual model's allowance resets. A 7,000-song
+library takes a few days of allowance the first time; you can make playlists from what's sorted on
 day one. When the sorting method improves, songs are re-checked the same way, and
 each keeps its current playlist until it has been.
 

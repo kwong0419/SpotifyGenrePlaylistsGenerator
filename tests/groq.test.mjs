@@ -434,9 +434,14 @@ test("titles with apostrophes, dots, '&' or a leading bracket are matched; real 
     ["Rock & Roll", "Rock and"], ["Rock & Roll", "Rock Roll"], ["(I Can't Get No) Satisfaction", "Satisfaction"], ["Él Me Mintió", "El Me"], ["7/11", "7 11"]]) {
     assert.ok(one(title, w), `${title} <- ${w}`);
   }
-  for (const [title, w] of [["The Bells", "The Thrill"], ["Song 12", "Song 13"], ["Love Story", "Love Me"], ["The Bells", "The"]]) {
+  for (const [title, w] of [["The Bells", "The Thrill"], ["Song 12", "Song 13"], ["Love Story", "Love Me"]]) {
     assert.ok(!one(title, w), `${title} <- ${w} should be rejected`);
   }
+  // Just "The": fine when it's the only song in the batch starting that way, not otherwise.
+  const pick = (w, ...titles) => read.json(JSON.stringify({ results: [{ n: 1, w, p: "pop", c: "h" }] }), batchOf(...titles)).size === 1;
+  assert.ok(pick("The", "The Bells", "Other Song"));
+  assert.ok(!pick("The", "The Bells", "The Night We Met"));
+  assert.ok(!pick("Love", "The Bells", "Other Song"));
 });
 
 test("a library full of punctuated titles is sorted without wasted re-asks", async () => {
@@ -470,6 +475,18 @@ test("a reply that only echoes \"The\" is asked again in smaller pieces, not sto
   const one = {};
   await classifySongs(client, songs.slice(0, 1).map((x) => ({ ...x, uri: "solo" })), NODES, one, { careful: true });
   assert.equal(one.solo.playlist, "indie-rock");
+});
+
+test("a model that always echoes just one word still sorts a batch in one request when the words differ", async () => {
+  const titles = ["The Night We Met", "Love Story", "Sunflower", "Blinding Lights", "Levitating", "Heat Waves"];
+  const songs = titles.map((title, i) => ({ uri: `u${i}`, title, artist: `Band ${i}`, featured: [] }));
+  const groq = new FakeGroq({ artists: Object.fromEntries(songs.map((x) => [x.artist, "pop"])) });
+  groq.echo = (title) => title.split(" ")[0];
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const cache = {};
+  await classifySongs(client, songs, NODES, cache);
+  assert.equal(Object.keys(cache).length, titles.length);
+  assert.equal(groq.requests, 1);
 });
 
 test("Groq's own refusal message is kept, and its real daily limit is learned", async () => {

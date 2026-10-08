@@ -153,7 +153,7 @@
       </div>
 
       <div class="option" id="budget-models-box" hidden>
-        <p><strong>Or continue now with another model.</strong> Each Groq model has its own free daily allowance. Smaller models are faster but may know fewer artists.</p>
+        <p><strong>Or continue now with another model.</strong> Each Groq model has its own free daily allowance. Smaller models know fewer songs, so they're less accurate. Your usual model takes over again once its allowance resets.</p>
         <div class="copy-row"><select id="budget-model"></select><button class="secondary" id="budget-switch">Use this model</button></div>
       </div>
 
@@ -203,7 +203,6 @@
         </datalist>
         <span class="small muted">The larger models know more artists. Change it if Groq retires the one in use.</span>
       </label>
-      <label class="check"><input type="checkbox" id="opt-auto-switch" checked> When a model's daily allowance runs out, carry on with another model (each has its own allowance)</label>
       <label>Last.fm API key <span class="muted">(optional)</span>
         <input id="opt-lastfm" placeholder="Fills in artists Groq doesn't know" autocomplete="off" spellcheck="false">
         <span class="small muted">Free from <a href="https://www.last.fm/api/account/create" target="_blank" rel="noopener">last.fm/api</a>. Helps with small artists.</span>
