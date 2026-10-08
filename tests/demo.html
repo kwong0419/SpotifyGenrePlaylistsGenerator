@@ -46,6 +46,8 @@
   const params = new URLSearchParams(location.search);
   if (params.get("models")) groq.models = params.get("models").split(",");
   if (params.get("unnumbered")) groq.unnumbered = true;
+  // ?limit120=N gives gpt-oss-120b a small daily allowance, to see the switch to another model.
+  if (params.get("limit120")) groq.dailyLimits["openai/gpt-oss-120b"] = +params.get("limit120");
   window.__fake = fake;
   window.__groq = groq;
   window.__GS_DEMO__ = {

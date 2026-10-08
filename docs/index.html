@@ -145,6 +145,7 @@
       <div class="bar"><div id="budget-fill"></div></div>
       <p id="budget-progress"></p>
       <p class="note" id="budget-when"></p>
+      <p class="small muted" id="budget-detail" hidden></p>
 
       <div class="option" id="budget-check-box">
         <p><strong>Groq may still have some left.</strong> This limit is the app's own cautious count of today's usage, not Groq's. Checking costs nothing: if Groq really is out, it says exactly when it resets.</p>
@@ -202,6 +203,7 @@
         </datalist>
         <span class="small muted">The larger models know more artists. Change it if Groq retires the one in use.</span>
       </label>
+      <label class="check"><input type="checkbox" id="opt-auto-switch" checked> When a model's daily allowance runs out, carry on with another model (each has its own allowance)</label>
       <label>Last.fm API key <span class="muted">(optional)</span>
         <input id="opt-lastfm" placeholder="Fills in artists Groq doesn't know" autocomplete="off" spellcheck="false">
         <span class="small muted">Free from <a href="https://www.last.fm/api/account/create" target="_blank" rel="noopener">last.fm/api</a>. Helps with small artists.</span>
