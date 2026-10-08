@@ -4,7 +4,7 @@ import {
   resolvePlaylists, syncPlaylists, planSync, SpotifyError, RateLimitedError, UNCATEGORIZED, NOT_SORTED_YET,
 } from "./core.js";
 import {
-  createGroq, chooseModel, chatModels, clearUsageEstimates, classifySongs, estimateSongJob, firstWord, supportsStrictOutput,
+  createGroq, chooseModel, chatModels, clearUsageEstimates, classifySongs, estimateSongJob, firstWord,
   GroqError, GroqDailyLimitError, PREFERRED_MODELS,
 } from "./groq.js";
 
@@ -228,9 +228,19 @@ const groqLedger = (model) => ({
   load: () => store.get(`groqLedger:${model}`, []),
   save: (e) => store.set(`groqLedger:${model}`, e),
 });
-const currentModel = () => store.get("groqModel", PREFERRED_MODELS[0]);
+const settingsModel = () => store.get("groqModel", PREFERRED_MODELS[0]);
+/**
+ * The model in use: the one in Settings, unless the listener chose another on the
+ * allowance screen, which lasts until the Settings model's allowance resets.
+ */
+function currentModel() {
+  const forNow = store.get("modelForNow", null);
+  if (forNow && forNow.until > Date.now() && forNow.model !== settingsModel()) return forNow.model;
+  if (forNow) store.del("modelForNow");
+  return settingsModel();
+}
 
-function groqClient(key = store.get("groqKey", ""), model = store.get("groqModel", PREFERRED_MODELS[0])) {
+function groqClient(key = store.get("groqKey", ""), model = currentModel()) {
   if (!key) return null;
   return createGroq({
     apiKey: key, model, fetchImpl: groqFetch, ledger: groqLedger(model),
@@ -449,7 +459,7 @@ async function scanLibrary() {
   try {
     const todo = tracks.filter((t) => !(t.uri in answers) && !(t.uri in corrections)).map(toSong);
     const rechecking = todo.filter((x) => x.uri in previous).length;
-    const estimate = estimateSongJob(await combinedBudget(groq), todo, state.nodes);
+    const estimate = estimateSongJob(groq, todo, state.nodes);
     // If nothing fits today, skip the plan: classifySongs stops before sending anything and
     // the allowance screen offers the ways forward (check with Groq, another model).
     if (todo.length && estimate.startsToday && (estimate.minutes >= 3 || estimate.days > 1)) {
@@ -458,7 +468,8 @@ async function scanLibrary() {
     const startedAt = Date.now();
     const verb = rechecking ? "Re-checking your songs" : "Sorting your songs";
     try {
-      groqInUse = await withModelFallback(groq, async (client, switched) => {
+      groqInUse = await runWith(groq, async (client) => {
+        const switched = client.model !== settingsModel();
         const line = liveProgress(`${verb}${switched ? ` with ${shortModel(client.model)}` : ""}…`, "songs",
           estimate.minutes * 60000, STEPS.sort);
         try {
@@ -518,7 +529,7 @@ async function scanLibrary() {
         const again = liveProgress("Taking a careful second look with catalog data…", "songs",
           ((withData.length * 60) / groqInUse.budget().tpm) * 60000, STEPS.sort);
         try {
-          groqInUse = await withModelFallback(groqInUse, (client) => classifySongs(client, withData, state.nodes, answers, {
+          groqInUse = await runWith(groqInUse, (client) => classifySongs(client, withData, state.nodes, answers, {
             examples, careful: true,
             onProgress: (done, total) => again.update(done, total),
             onSaved: (c) => saveThrottled("songAnswers", c),
@@ -587,58 +598,16 @@ async function scanLibrary() {
 const shortModel = (m) => String(m).replace(/^openai\//, "");
 
 /**
- * Runs `task(client, switched)` with the user's model, and if that model's free daily
- * allowance runs out, carries on with the next model the key can use (each model has its
- * own allowance on the account), until the work is done or every model is used up.
- * Only models with strict structured output are used, so answers stay checkable.
- * Returns the client that finished; throws the last GroqDailyLimitError otherwise.
- * Turned off in Settings, it only ever uses the chosen model.
+ * Runs `task(client)` and keeps its counters for the diagnostics. Only the chosen model is
+ * used: when its allowance runs out, the allowance screen asks before using another.
  */
-/** The user's model, then (if allowed in Settings) the other strict-mode models the key has. */
-async function modelChain(primary) {
-  const chain = [primary.model];
-  if (!store.get("autoSwitch", true)) return chain;
-  let available = store.get("groqModels", null);
-  if (!available) {
-    try { available = await primary.listModels(); store.set("groqModels", available); } catch { available = []; }
+async function runWith(client, task) {
+  try {
+    await task(client);
+  } finally {
+    state.runStats.push({ model: client.model, ...client.stats });
   }
-  for (const m of [...PREFERRED_MODELS, ...chatModels(available)]) {
-    if (available.includes(m) && supportsStrictOutput(m) && !chain.includes(m)) chain.push(m);
-  }
-  return chain;
-}
-
-/** For estimates: the allowances of every model the run can use, added together. */
-async function combinedBudget(primary) {
-  const clients = (await modelChain(primary)).map((m, i) => (i === 0 ? primary : groqClient(undefined, m)));
-  const budgets = clients.map((c) => c.budget());
-  return {
-    model: primary.model,
-    budget: () => ({
-      tpm: budgets[0].tpm,
-      tpd: budgets.reduce((n, b) => n + b.tpd, 0),
-      dayLeft: budgets.reduce((n, b) => n + b.dayLeft, 0),
-    }),
-  };
-}
-
-async function withModelFallback(primary, task) {
-  const chain = await modelChain(primary);
-  let last = null;
-  for (const [i, model] of chain.entries()) {
-    const client = i === 0 ? primary : groqClient(undefined, model);
-    try {
-      await task(client, i > 0);
-      state.runStats.push({ model, ...client.stats });
-      return client;
-    } catch (err) {
-      state.runStats.push({ model, ...client.stats });
-      if (!(err instanceof GroqDailyLimitError)) throw err;
-      last = err;
-      state.modelsUsedUp = [...(state.modelsUsedUp || []), model];
-    }
-  }
-  throw last;
+  return client;
 }
 
 /** Saved data from versions that sorted by artist; none of it is used any more. */
@@ -702,11 +671,7 @@ function showGroqPaused(err) {
     : `By the app's count, ${model}'s allowance frees up after ${formatWhen(err.resumeAt)}. Open this page again then and it continues where it stopped.`;
   $("budget-detail").textContent = err.detail ? `Groq said: "${err.detail.replace(/\s+/g, " ").slice(0, 300)}"` : "";
   $("budget-detail").hidden = !err.detail;
-  const usedUp = state.modelsUsedUp || [];
-  if (usedUp.length > 1) {
-    $("budget-title").textContent = "Today's free allowances are used up";
-    $("budget-lead").textContent = `${usedUp.map(shortModel).join(" and ")} both reached their daily limit. Everything sorted so far is saved.`;
-  }
+  state.pausedModel = { model, until: err.resumeAt };
   $("budget-check-box").hidden = err.source !== "estimate";
   $("budget-continue-box").hidden = sortedSongs === 0;
   document.title = `Paused until ${formatWhen(err.resumeAt)} — ${APP_TITLE}`;
@@ -1118,7 +1083,6 @@ function openSettings() {
   $("opt-lastfm").value = store.get("lastfm", "");
   $("opt-groq-key").value = store.get("groqKey", "");
   $("opt-groq-model").value = store.get("groqModel", PREFERRED_MODELS[0]);
-  $("opt-auto-switch").checked = store.get("autoSwitch", true);
   const own = store.get("clientId");
   $("app-source").textContent = own
     ? `Using your own Spotify app (Client ID …${own.slice(-4)}).`
@@ -1138,7 +1102,7 @@ function saveSettings() {
   if (groqKey !== store.get("groqKey", "")) store.del("groqModels"); // a new key may offer other models
   store.set("groqKey", groqKey);
   store.set("groqModel", groqModel);
-  store.set("autoSwitch", $("opt-auto-switch").checked);
+  if (groqChanged) store.del("modelForNow"); // a model picked in Settings applies straight away
   if (!$("screen-preview").hidden) {
     if (store.get("lastfm", "") !== lastfmBefore || groqChanged) scan();
     else showPreview();
@@ -1157,7 +1121,10 @@ function wire() {
   $("budget-check").addEventListener("click", () => { clearUsageEstimates(groqLedger(currentModel())); scan(); });
   $("budget-switch").addEventListener("click", () => {
     if (!$("budget-model").value) return;
-    store.set("groqModel", $("budget-model").value);
+    // Only until the usual model's allowance resets; then it's used again.
+    const forNow = store.get("modelForNow", null);
+    const until = forNow?.until > Date.now() ? forNow.until : state.pausedModel?.until || Date.now() + 864e5;
+    store.set("modelForNow", { model: $("budget-model").value, until });
     scan();
   });
   $("cooldown-retry").addEventListener("click", () => {

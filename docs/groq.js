@@ -361,18 +361,27 @@ export function answerReader(nodes) {
     return k === "none" ? "none" : lookup.get(k) || null;
   };
   // The answer must repeat the start of the title (its first two words): one word alone
-  // can't tell apart neighbouring songs that both start with "The" or "Love". Compared on
+  // can't tell apart neighbouring songs that both start with "The" or "Love" (it's
+  // accepted when no other song in the batch starts the same way). Compared on
   // letters and digits only, so "Don't Start" = "Dont Start", "P.Y.T." = "PYT", "&" = "and",
   // and a leading "(I Can't Get No)" may be skipped. Real mismatches still fail.
-  const sameWord = (given, title) => {
-    const got = letters(given);
-    const t = String(title);
+  const startsOf = (title) => {
+    const t = String(title ?? "");
     const unbracketed = t.replace(/^\s*[([][^)\]]*[)\]]\s*/, "");
     // "&" may be echoed as "and" or left out altogether.
-    const starts = [t, unbracketed, t.replace(/&/g, " "), unbracketed.replace(/&/g, " ")].map(letters);
-    if (!starts[0]) return true;
-    return starts.some((want) => want && got.length >= Math.min(4, want.length)
-      && (want.startsWith(got) || got.startsWith(want)));
+    return [t, unbracketed, t.replace(/&/g, " "), unbracketed.replace(/&/g, " ")].map(letters).filter(Boolean);
+  };
+  const matches = (got, starts, min) => starts.some((want) => got.length >= Math.min(min, want.length)
+    && (want.startsWith(got) || got.startsWith(want)));
+  // A short echo ("The", "Love") is enough when no other song in the batch starts that way:
+  // then it can't have been meant for another song.
+  const sameWord = (given, song, batch) => {
+    const got = letters(given);
+    const starts = startsOf(song.title);
+    if (!starts.length) return true;
+    if (matches(got, starts, 4)) return true;
+    return !!got && matches(got, starts, 1)
+      && !batch.some((other) => other !== song && matches(got, startsOf(other.title), 1));
   };
   const json = (text, batch) => {
     const out = new Map();
@@ -382,7 +391,7 @@ export function answerReader(nodes) {
       const song = batch[+n - 1];
       if (!v || !Number.isInteger(+n) || !song || out.has(k)) return;
       // Meant for another song? (Asked about one song, there's no other song it could mean.)
-      if (batch.length > 1 && !sameWord(word, song.title)) { out.rejected = (out.rejected || 0) + 1; return; }
+      if (batch.length > 1 && !sameWord(word, song, batch)) { out.rejected = (out.rejected || 0) + 1; return; }
       out.set(k, { playlist: v, confidence: ["high", "medium", "low"].includes(confidence) ? confidence : "medium" });
     };
     const CONFIDENCE = { h: "high", m: "medium", l: "low" };
