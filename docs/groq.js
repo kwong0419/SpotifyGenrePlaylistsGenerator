@@ -474,7 +474,7 @@ export function estimateSongJob(groq, songs, nodes, batchSize = SONG_BATCH) {
  */
 export async function classifySongs(groq, songs, nodes, cache, {
   batchSize = SONG_BATCH, examples = [], moreContext = null, onProgress = () => {}, onSaved = () => {},
-  onLookup = () => {},
+  onLookup = () => {}, careful = false,
 } = {}) {
   const todo = songs.filter((s) => !(s.uri in cache));
   const read = answerReader(nodes);
@@ -495,6 +495,11 @@ export async function classifySongs(groq, songs, nodes, cache, {
     onProgress(done, todo.length);
   };
 
+  // `careful`: go straight to the careful look (songs that already come with extra evidence).
+  if (careful) {
+    await runBatches(groq, todo, { spec: spec(true), batchSize: CAREFUL_BATCH, key: (s) => s.uri, line: songLine, onBatch: (r) => save(r, true) });
+    return cache;
+  }
   await runBatches(groq, todo, { spec: spec(false), batchSize, key: (s) => s.uri, line: songLine, onBatch: (r) => save(r, false) });
 
   if (unsure.length) {

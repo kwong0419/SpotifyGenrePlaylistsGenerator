@@ -476,3 +476,28 @@ test("the counters show what happened: requests, cut-offs, rejected answers, spl
   assert.ok(client.stats.rejected >= 30, `answers meant for neighbours were counted: ${client.stats.rejected}`);
   assert.ok(client.stats.tokens > 0);
 });
+
+// ---- a second look for songs the model didn't know at all
+
+test("songs the model didn't know get a careful look with catalog data, and are placed only on that data", async () => {
+  const groq = new FakeGroq();
+  groq.fromStoreGenre = (genre) => (genre === "Singer/Songwriter" ? "folk-acoustic" : "none");
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const cache = {};
+  await classifySongs(client, [
+    { uri: "a", title: "Golden Hour", artist: "Small Local Band", featured: [], storeGenre: "Singer/Songwriter" },
+    { uri: "b", title: "Basement Demo", artist: "Small Local Band", featured: [], storeGenre: "Ringtones" },
+  ], NODES, cache, { careful: true });
+  assert.equal(groq.carefulRequests, 1, "asked once, carefully, with more thinking");
+  assert.equal(cache.a.playlist, "folk-acoustic", "placed from Apple Music's genre");
+  assert.equal(cache.b.playlist, "none", "data that doesn't place it: still not guessed");
+  assert.match(groq.seen[0], /Apple Music genre: Singer\/Songwriter/);
+});
+
+test("the careful look uses small batches", async () => {
+  const songs = Array.from({ length: 70 }, (_, i) => ({ uri: `c${i}`, title: `Song ${i}`, artist: `Band ${i}`, featured: [], storeGenre: "Pop" }));
+  const groq = new FakeGroq();
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  await classifySongs(client, songs, NODES, {}, { careful: true });
+  assert.deepEqual(groq.calls, [30, 30, 10]);
+});
