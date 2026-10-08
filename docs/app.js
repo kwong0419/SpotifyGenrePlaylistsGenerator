@@ -403,6 +403,7 @@ async function scanLibrary() {
   if (store.get("songAnswersFor", "") !== listId) {
     store.del("songAnswers");
     store.del("lastfmTried");
+    store.del("secondLookTried");
     store.set("songAnswersFor", listId);
   }
   if (store.get("songPicksFor", "") !== listId) store.del("songPicks");
@@ -480,39 +481,58 @@ async function scanLibrary() {
       saveThrottled("songAnswers", answers, true);
     }
 
-    // Optional second chance with real listener tags: songs Groq didn't know at all ("none")
-    // are asked again with Last.fm's tags for their artist and the song. Once per song.
-    if (lastfmKey) {
-      const tried = new Set(store.get("lastfmTried", []));
-      const unplaced = tracks.filter((t) => answers[t.uri]?.playlist === "none" && !tried.has(t.uri) && t.artistIds[0]);
-      const names = new Map(unplaced.map((t) => [t.artistIds[0], t.artistNames[0]]));
-      const need = [...names.keys()].filter((id) => !(id in lfm));
+    // A second look for songs Groq didn't know at all ("none"), the same as for unsure ones:
+    // look each up in real catalogs (Apple Music's genre for the song; with a Last.fm key,
+    // listener tags for the song and its artist) and ask again, carefully, with that data.
+    // Songs with no data anywhere aren't re-asked: they stay in Uncategorized rather than
+    // being guessed. Each song gets this second look once.
+    const tried = new Set(store.get("secondLookTried", []));
+    const unknown = tracks.filter((t) => answers[t.uri]?.playlist === "none"
+      && answers[t.uri]?.confidence !== "low" // unsure ones already had their careful look
+      && !tried.has(t.uri) && !(t.uri in corrections));
+    if (unknown.length) {
+      const songs = unknown.map(toSong);
+      const withData = [];
       try {
-        for (const [i, id] of need.entries()) {
-          progress("Looking up artists on Last.fm…", i, need.length, `${i} of ${need.length} artists`, STEPS.sort);
-          const tags = await lastfmTags(names.get(id), lastfmKey);
-          if (tags) lfm[id] = tags;
-          if (i % 25 === 0) store.set("lastfmTags", lfm);
-          await new Promise((r) => setTimeout(r, 220)); // Last.fm allows about 5 requests a second
+        for (const [i, song] of songs.entries()) {
+          progress("Looking up songs Groq didn't know…", i, songs.length,
+            `${i.toLocaleString()} of ${songs.length.toLocaleString()} songs · checking Apple Music${lastfmKey ? " and Last.fm" : ""} `
+            + `· about ${minutesText((songs.length - i) * 3100)} left`, STEPS.sort);
+          const extra = await moreContext(song);
+          const t = unknown[i];
+          if (lastfmKey && t.artistIds[0] && !(t.artistIds[0] in lfm)) {
+            const tags = await lastfmTags(t.artistNames[0], lastfmKey);
+            if (tags) { lfm[t.artistIds[0]] = tags; store.set("lastfmTags", lfm); }
+          }
+          const evidence = { ...song, ...extra, context: lfm[t.artistIds[0]] || [] };
+          if (evidence.storeGenre || evidence.songTags?.length || evidence.context.length) withData.push(evidence);
+          else tried.add(song.uri); // nothing anywhere to go on: stays in Uncategorized, not guessed
+          if (i % 10 === 0) store.set("secondLookTried", [...tried]);
         }
       } finally {
-        store.set("lastfmTags", lfm);
+        store.set("secondLookTried", [...tried]);
       }
-      const retry = unplaced.filter((t) => lfm[t.artistIds[0]]?.length);
-      for (const t of retry) delete answers[t.uri];
-      for (const t of unplaced) tried.add(t.uri);
-      store.set("lastfmTried", [...tried]);
-      if (retry.length) {
-        const again = liveProgress("Sorting songs again with Last.fm's tags…", "songs",
-          ((retry.length * 30) / groqInUse.budget().tpm) * 60000, STEPS.sort);
+      if (withData.length) {
+        const before = Object.fromEntries(withData.map((song) => [song.uri, answers[song.uri]]));
+        for (const song of withData) delete answers[song.uri];
+        const again = liveProgress("Taking a careful second look with catalog data…", "songs",
+          ((withData.length * 60) / groqInUse.budget().tpm) * 60000, STEPS.sort);
         try {
-          groqInUse = await withModelFallback(groqInUse, (client) => classifySongs(client, retry.map(toSong), state.nodes, answers, {
-            examples, moreContext,
+          groqInUse = await withModelFallback(groqInUse, (client) => classifySongs(client, withData, state.nodes, answers, {
+            examples, careful: true,
             onProgress: (done, total) => again.update(done, total),
             onSaved: (c) => saveThrottled("songAnswers", c),
           }));
         } finally {
           again.stop();
+          // Answered songs have had their second look. Any not reached (the allowance ran out)
+          // keep their earlier "none" and get the second look on the next run.
+          for (const song of withData) {
+            if (song.uri in answers) tried.add(song.uri);
+            else answers[song.uri] = before[song.uri];
+          }
+          store.set("secondLookTried", [...tried]);
+          saveThrottled("songAnswers", answers, true);
         }
       }
     }
@@ -966,11 +986,11 @@ function askAgain(tracks) {
     + "This uses some of today's Groq allowance. Songs Groq still can't place will stay in Uncategorized.")) return;
   const answers = store.get("songAnswers", {});
   const previous = store.get("songPicks", {});
-  const tried = new Set(store.get("lastfmTried", []));
+  const tried = new Set(store.get("secondLookTried", []));
   for (const t of tracks) { delete answers[t.uri]; delete previous[t.uri]; tried.delete(t.uri); }
   store.set("songAnswers", answers);
   store.set("songPicks", previous);
-  store.set("lastfmTried", [...tried]);
+  store.set("secondLookTried", [...tried]);
   scan();
 }
 
@@ -1168,7 +1188,7 @@ function wire() {
   $("refresh-genres").addEventListener("click", () => {
     if (!confirm("Sort every song again from scratch? This uses Groq's daily allowance again, so a big library may take more than a day.")) return;
     // Your own corrections are kept.
-    ["songAnswers", "songPicks", "lastfmTried", "lastfmTags", "lastfmSongTags", "appleGenres"].forEach((k) => store.del(k));
+    ["songAnswers", "songPicks", "lastfmTried", "secondLookTried", "lastfmTags", "lastfmSongTags", "appleGenres"].forEach((k) => store.del(k));
     $("settings").close();
     if (store.get("token")) scan();
   });
