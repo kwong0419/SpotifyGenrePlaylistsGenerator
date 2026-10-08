@@ -429,7 +429,7 @@ test("store genres and song tags reach the model as evidence", async () => {
 
 test("titles with apostrophes, dots, '&' or a leading bracket are matched; real mismatches still aren't", () => {
   const read = answerReader(NODES);
-  const one = (title, w) => read.json(JSON.stringify({ results: [{ n: 1, w, p: "pop", c: "h" }] }), batchOf(title)).size === 1;
+  const one = (title, w) => read.json(JSON.stringify({ results: [{ n: 1, w, p: "pop", c: "h" }] }), batchOf(title, "Other Song")).size === 1;
   for (const [title, w] of [["Don't Start Now", "Dont Start"], ["Ain't No Mountain High Enough", "Aint No"], ["P.Y.T. (Pretty Young Thing)", "PYT Pretty"],
     ["Rock & Roll", "Rock and"], ["Rock & Roll", "Rock Roll"], ["(I Can't Get No) Satisfaction", "Satisfaction"], ["Él Me Mintió", "El Me"], ["7/11", "7 11"]]) {
     assert.ok(one(title, w), `${title} <- ${w}`);
@@ -452,6 +452,24 @@ test("a library full of punctuated titles is sorted without wasted re-asks", asy
   assert.equal(Object.keys(cache).length, 60);
   assert.equal(groq.requests, 1, "one request for the whole batch");
   assert.equal(client.stats.rejected, 0);
+});
+
+test("a reply that only echoes \"The\" is asked again in smaller pieces, not stopped as a format problem", async () => {
+  const songs = ["The Less I Know the Better", "The Night We Met", "The Way Life Goes"]
+    .map((title, i) => ({ uri: `t${i}`, title, artist: `Band ${i}`, featured: [] }));
+  const groq = new FakeGroq({ artists: Object.fromEntries(songs.map((x) => [x.artist, "indie-rock"])) });
+  groq.echo = (title) => title.split(" ")[0]; // just "The"
+  const { client } = setup({ groq, model: "openai/gpt-oss-120b" });
+  const cache = {};
+  await classifySongs(client, songs, NODES, cache);
+  assert.equal(Object.keys(cache).length, 3);
+  assert.ok(Object.values(cache).every((a) => a.playlist === "indie-rock"));
+  assert.equal(groq.structuredRequests, groq.requests, "stayed with strict JSON replies");
+
+  // Asked about a single song (as on the careful second look), a one-word echo is fine.
+  const one = {};
+  await classifySongs(client, songs.slice(0, 1).map((x) => ({ ...x, uri: "solo" })), NODES, one, { careful: true });
+  assert.equal(one.solo.playlist, "indie-rock");
 });
 
 test("Groq's own refusal message is kept, and its real daily limit is learned", async () => {
