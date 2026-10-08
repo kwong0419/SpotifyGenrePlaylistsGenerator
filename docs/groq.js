@@ -381,7 +381,8 @@ export function answerReader(nodes) {
       const k = String(n);
       const song = batch[+n - 1];
       if (!v || !Number.isInteger(+n) || !song || out.has(k)) return;
-      if (!sameWord(word, song.title)) { out.rejected = (out.rejected || 0) + 1; return; } // meant for another song
+      // Meant for another song? (Asked about one song, there's no other song it could mean.)
+      if (batch.length > 1 && !sameWord(word, song.title)) { out.rejected = (out.rejected || 0) + 1; return; }
       out.set(k, { playlist: v, confidence: ["high", "medium", "low"].includes(confidence) ? confidence : "medium" });
     };
     const CONFIDENCE = { h: "high", m: "medium", l: "low" };
@@ -585,6 +586,13 @@ async function runBatches(groq, items, { spec, line, key, batchSize, onBatch }) 
   async function attempt(batch, retries = 2) {
     const reply = await ask(batch);
     if (!reply) return split(batch, retries);
+
+    if (!reply.answers.size && reply.answers.rejected) {
+      // Readable, but every answer echoed a title that doesn't match (often just "The"):
+      // the format is fine, so ask about fewer songs at a time instead of switching format.
+      readableSeen = true;
+      return split(batch, retries);
+    }
 
     if (!reply.answers.size) {
       if (++streak >= 8) throw formatError(reply.text);
