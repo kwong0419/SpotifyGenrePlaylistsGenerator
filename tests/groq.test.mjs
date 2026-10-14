@@ -497,7 +497,7 @@ test("Groq's own refusal message is kept, and its real daily limit is learned", 
   assert.ok(err instanceof GroqDailyLimitError);
   assert.match(err.detail, /tokens per day \(TPD\): Limit 3000/);
   assert.ok(s.entries().some((e) => e.limitTpd === 3000), "the real limit is remembered");
-  const again = createGroq({ apiKey: "k", model: "llama-3.3-70b-versatile", fetchImpl: s.groq.fetch, ledger: s.ledger });
+  const again = createGroq({ apiKey: "k", model: "llama-3.3-70b-versatile", fetchImpl: s.groq.fetch, ledger: s.ledger, now: s.clock.now });
   assert.equal(again.budget().tpd, 2700, "later budgeting uses 90% of Groq's real limit");
 });
 

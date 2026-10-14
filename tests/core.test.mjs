@@ -296,7 +296,7 @@ test("a clean write is checked with one count request; a troubled one is read ba
 
 // ---- running more than once: the app's real sequence (group -> resolve -> plan -> sync)
 
-async function appRun(sp, remembered, { byArtist, songPicks = {}, isPending, selected }) {
+async function appRun(sp, remembered, { byArtist, songPicks = {}, isPending, selected, style }) {
   const api = fakeClient(sp);
   const { tracks: liked } = await fetchLikedTracks(api);
   const { tracks } = dedupeTracks(liked);
@@ -305,7 +305,7 @@ async function appRun(sp, remembered, { byArtist, songPicks = {}, isPending, sel
   const { targets } = await resolvePlaylists(api, ME, all, nameFor, remembered);
   // Like the app: subgenres that already have a playlist stay separate.
   const existing = new Set([...targets].filter(([, t]) => !t.isNew).map(([id]) => id));
-  const groups = groupSongs(tracks, picksFor(tracks, byArtist, songPicks), NODES, { isPending, keepIds: existing });
+  const groups = groupSongs(tracks, picksFor(tracks, byArtist, songPicks), NODES, { isPending, keepIds: existing, style });
   // Like the app: everything ticked except Uncategorized (and Not sorted yet can't be ticked).
   const pick = selected || new Set(groups.map((g) => g.bucket.id).filter((id) => ![NOT_SORTED_YET.id, UNCATEGORIZED.id].includes(id)));
   const plan = planSync(groups, targets, pick, NODES);
@@ -343,6 +343,31 @@ test("a song that changes genre on a later run is never left in two playlists, e
   const country = sp.playlists.get("pl1").items;
   assert.equal(country.length, 11, "Country was updated even though it wasn't ticked");
   assert.ok(!country.includes("spotify:track:t0"));
+});
+
+test("switching between main genres and detailed subgenres reuses playlists, every song once", async () => {
+  const liked = [];
+  for (let i = 0; i < 20; i++) liked.push(track(i, `House ${i}`, "housey"));
+  for (let i = 20; i < 26; i++) liked.push(track(i, `Dance ${i}`, "edm"));
+  const sp = new FakeSpotify({ liked, artists: {} });
+  const remembered = {};
+  const byArtist = { housey: "house", edm: "electronic-dance" };
+  const songsIn = (id) => sp.playlists.get(remembered[id].id).items.length;
+
+  await appRun(sp, remembered, { byArtist, style: "detailed" });
+  assert.equal(sp.followed.length, 2, "House has its own playlist");
+  assert.equal(songsIn("house"), 20);
+
+  await appRun(sp, remembered, { byArtist, style: "main" });
+  assertEachSongOnce(sp);
+  assert.equal(sp.followed.length, 2, "no new playlists");
+  assert.equal(songsIn("electronic-dance"), 26, "House songs moved into Electronic");
+  assert.equal(songsIn("house"), 0, "the House playlist is emptied");
+
+  await appRun(sp, remembered, { byArtist, style: "detailed" });
+  assertEachSongOnce(sp);
+  assert.equal(sp.followed.length, 2, "the same House playlist is used again");
+  assert.equal(songsIn("house"), 20);
 });
 
 test("a genre whose songs all moved away is emptied, not left stale", async () => {

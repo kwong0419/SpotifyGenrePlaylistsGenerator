@@ -217,12 +217,15 @@ export const MIN_SUBGENRE_SONGS = 15;
  * Groups songs into playlists from the playlist chosen for each song (`picks`: uri ->
  * playlist id or "none"). A subgenre only becomes its own playlist when it has at least
  * `minSubgenre` songs, or a playlist for it already exists (`keepIds`), so playlists don't
- * flip between runs; otherwise its songs go into the broad genre's playlist.
+ * flip between runs; otherwise its songs go into the broad genre's playlist. With
+ * `style: "main"` every subgenre goes into its broad genre: one playlist per main genre.
  * Songs answered "none", or picked into an unknown id, go to Uncategorized; songs for
  * which `isPending` is true (not sorted yet) to Not sorted yet.
  * Returns [{ bucket, tracks }] in taxonomy order, then Uncategorized, then Not sorted yet.
  */
-export function groupSongs(tracks, picks, nodes, { isPending = () => false, keepIds = new Set(), minSubgenre = MIN_SUBGENRE_SONGS } = {}) {
+export function groupSongs(tracks, picks, nodes, {
+  isPending = () => false, keepIds = new Set(), minSubgenre = MIN_SUBGENRE_SONGS, style = "detailed",
+} = {}) {
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const chosen = new Map();
   const counts = new Map();
@@ -234,7 +237,8 @@ export function groupSongs(tracks, picks, nodes, { isPending = () => false, keep
   const groups = new Map([...nodes, UNCATEGORIZED, NOT_SORTED_YET].map((n) => [n.id, { bucket: n, tracks: [] }]));
   for (const t of tracks) {
     let node = chosen.get(t);
-    if (node.parent && (counts.get(node.id) || 0) < minSubgenre && !keepIds.has(node.id)) node = byId.get(node.parent);
+    const rollUp = style === "main" || ((counts.get(node.id) || 0) < minSubgenre && !keepIds.has(node.id));
+    if (node.parent && rollUp) node = byId.get(node.parent);
     groups.get(node.id).tracks.push(t);
   }
   return [...groups.values()].filter((g) => g.tracks.length);

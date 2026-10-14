@@ -99,6 +99,13 @@
         <p class="success" id="ready-banner" hidden></p>
         <h1>Your genres</h1>
         <p class="lead" id="summary"></p>
+        <fieldset class="style-pick">
+          <legend>Playlist style</legend>
+          <label class="check"><input type="radio" name="playlist-style" value="main"> <span><strong>Main genres</strong> · about 25 broad playlists, like Electronic &amp; Dance or Hip-Hop &amp; Rap. The most reliable.</span></label>
+          <label class="check"><input type="radio" name="playlist-style" value="detailed"> <span><strong>Detailed subgenres</strong> · also splits big genres into styles like House, Techno or Trap.</span></label>
+          <p class="warn small" id="style-disclaimer" hidden>Detailed subgenres aren't perfectly accurate. Similar styles (like House and Deep House, or Trap and Drill) are sometimes mixed up, so expect a few near-misses. Use <em>Move to…</em> on any song to fix it.</p>
+          <p class="small muted" id="style-emptied" hidden></p>
+        </fieldset>
         <div class="row between">
           <span class="small muted">Pick the playlists you want. Click a genre to see its songs.</span>
           <span class="small"><button class="link" id="select-all">All</button> · <button class="link" id="select-none">None</button></span>
@@ -189,6 +196,12 @@
         <input id="opt-prefix" placeholder="Liked · ">
       </label>
       <label class="check"><input type="checkbox" id="opt-public"> Make new playlists public</label>
+      <label>Playlist style
+        <select id="opt-style">
+          <option value="main">Main genres (most reliable)</option>
+          <option value="detailed">Detailed subgenres (may have near-misses)</option>
+        </select>
+      </label>
       <label>Groq API key
         <input id="opt-groq-key" placeholder="gsk_…" autocomplete="off" spellcheck="false">
         <span class="small muted">Free from <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>. Used to work out genres.</span>

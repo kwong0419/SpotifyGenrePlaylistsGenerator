@@ -148,6 +148,12 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
 #budget-fill { height: 100%; width: 0; background: var(--accent); }
 @media (max-width: 480px) { .stats { grid-template-columns: 1fr; } }
 
+.style-pick { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px 4px; margin: 0 0 1rem; }
+.style-pick legend { font-weight: 600; padding: 0 4px; }
+.style-pick label.check { align-items: flex-start; margin: 0 0 10px; }
+.style-pick input[type="radio"] { margin-top: 4px; flex: none; }
+.warn { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 8px; padding: 8px 12px; margin: 0 0 10px; }
+#opt-style { display: block; width: 100%; margin-top: 4px; }
 .option { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 14px; }
 .option p { margin: 0 0 10px; }
 select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; flex: 1 1 220px; }

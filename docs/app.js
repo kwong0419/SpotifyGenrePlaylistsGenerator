@@ -228,6 +228,35 @@ const groqLedger = (model) => ({
   load: () => store.get(`groqLedger:${model}`, []),
   save: (e) => store.set(`groqLedger:${model}`, e),
 });
+/**
+ * "main" (one playlist per main genre) or "detailed" (big subgenres get their own). Someone
+ * who already made subgenre playlists before this choice existed keeps detailed ones.
+ */
+function playlistStyle() {
+  const chosen = store.get("playlistStyle", null);
+  if (chosen) return chosen;
+  const subIds = new Set((state.nodes || []).filter((n) => n.parent).map((n) => n.id));
+  return Object.keys(store.get("playlists", {})).some((id) => subIds.has(id)) ? "detailed" : "main";
+}
+
+/** The playlists ticked to start with: every genre with a few songs, not Uncategorized. */
+function defaultSelection() {
+  return new Set(state.groups
+    .filter((g) => ![UNCATEGORIZED.id, NOT_SORTED_YET.id].includes(g.bucket.id) && g.tracks.length >= MIN_SONGS_PRESELECTED)
+    .map((g) => g.bucket.id));
+}
+
+/** Switches between main genres and detailed subgenres. Uses the saved answers: no Groq requests. */
+function setPlaylistStyle(style) {
+  if (style === playlistStyle()) return;
+  store.set("playlistStyle", style);
+  state.moveOptionsHtml = null;
+  if (!state.regroup || !state.targets) return; // applied when the preview is next shown
+  applyExistingPlaylists();
+  state.selected = defaultSelection();
+  if (!$("screen-preview").hidden) renderPreview();
+}
+
 const settingsModel = () => store.get("groqModel", PREFERRED_MODELS[0]);
 /**
  * The model in use: the one in Settings, unless the listener chose another on the
@@ -570,7 +599,7 @@ async function scanLibrary() {
       const p = corrections[t.uri]?.playlist ?? answers[t.uri]?.playlist ?? previous[t.uri];
       if (p !== undefined) picks[t.uri] = p;
     }
-    return groupSongs(tracks, picks, state.nodes, { isPending: (t) => !(t.uri in picks), keepIds });
+    return groupSongs(tracks, picks, state.nodes, { isPending: (t) => !(t.uri in picks), keepIds, style: playlistStyle() });
   };
   state.groups = state.regroup(new Set(Object.keys(store.get("playlists", {}))));
   // Which models sorted the songs (more than one when one's allowance ran out mid-run).
@@ -585,9 +614,7 @@ async function scanLibrary() {
     hasLastfm: !!lastfmKey,
     unsure: tracks.filter((t) => answers[t.uri]?.confidence === "low" && !(t.uri in corrections)).length,
   };
-  state.selected = new Set(state.groups
-    .filter((g) => ![UNCATEGORIZED.id, NOT_SORTED_YET.id].includes(g.bucket.id) && g.tracks.length >= MIN_SONGS_PRESELECTED)
-    .map((g) => g.bucket.id));
+  state.selected = defaultSelection();
   state.groqResumeAt = paused?.resumeAt || null;
 
   if (!paused) store.del("groqDays"); // fully sorted: a future multi-day run starts at day 1
@@ -789,6 +816,17 @@ function renderPreview() {
   }
   $("summary").textContent = parts.join(" ");
 
+  const style = playlistStyle();
+  document.querySelectorAll('input[name="playlist-style"]').forEach((r) => { r.checked = r.value === style; });
+  $("style-disclaimer").hidden = style !== "detailed";
+  // Subgenre playlists made earlier lose their songs to the main genre's playlist.
+  const subsEmptied = style === "main" ? state.nodes.filter((n) => n.parent
+    && state.targets.get(n.id) && !state.targets.get(n.id).isNew).length : 0;
+  $("style-emptied").hidden = !subsEmptied;
+  $("style-emptied").textContent = `${subsEmptied} subgenre playlist${subsEmptied === 1 ? "" : "s"} you made before `
+    + `will be emptied and ${subsEmptied === 1 ? "its" : "their"} songs moved to the main genre's playlist. `
+    + "Apps can't delete Spotify playlists, so delete empty ones in Spotify if you like. Switching back refills them.";
+
   // Genres that already have a playlist but no songs now (they all moved elsewhere).
   const shown = new Set(state.groups.map((g) => g.bucket.id));
   const emptied = [...state.nodes, UNCATEGORIZED]
@@ -918,7 +956,9 @@ function songItem(t) {
 
 /** The "Move to…" menu: every playlist (subgenres under their genre), Uncategorized, undo. */
 function moveOptions(corrected) {
+  // With main genres only, a subgenre isn't a playlist, so it isn't offered.
   state.moveOptionsHtml ||= state.nodes
+    .filter((n) => playlistStyle() === "detailed" || !n.parent)
     .map((n) => `<option value="${n.id}">${n.parent ? "\u00a0\u00a0\u21b3 " : ""}${n.name.replace(/&/g, "&amp;")}</option>`)
     .join("") + '<option value="none">Uncategorized</option>';
   return '<option value="" selected>Move to…</option>'
@@ -1080,6 +1120,7 @@ function showDone(results, warnings, retired = []) {
 function openSettings() {
   $("opt-prefix").value = prefix();
   $("opt-public").checked = store.get("public", false);
+  $("opt-style").value = playlistStyle();
   $("opt-lastfm").value = store.get("lastfm", "");
   $("opt-groq-key").value = store.get("groqKey", "");
   $("opt-groq-model").value = store.get("groqModel", PREFERRED_MODELS[0]);
@@ -1095,6 +1136,7 @@ function saveSettings() {
   const lastfmBefore = store.get("lastfm", "");
   store.set("prefix", newPrefix);
   store.set("public", $("opt-public").checked);
+  setPlaylistStyle($("opt-style").value);
   store.set("lastfm", $("opt-lastfm").value.trim());
   const groqKey = $("opt-groq-key").value.trim();
   const groqModel = $("opt-groq-model").value.trim() || PREFERRED_MODELS[0];
@@ -1137,6 +1179,8 @@ function wire() {
   $("settings-btn").addEventListener("click", openSettings);
   $("settings").addEventListener("close", () => { if ($("settings").returnValue === "close") saveSettings(); });
   $("select-all").addEventListener("click", () => { state.groups.filter((g) => g.bucket.id !== NOT_SORTED_YET.id).forEach((g) => state.selected.add(g.bucket.id)); renderPreview(); });
+  document.querySelectorAll('input[name="playlist-style"]').forEach((r) =>
+    r.addEventListener("change", () => r.checked && setPlaylistStyle(r.value)));
   $("select-none").addEventListener("click", () => { state.selected.clear(); renderPreview(); });
   $("copy-uri").addEventListener("click", async () => {
     try { await navigator.clipboard.writeText(redirectUri); $("copy-uri").textContent = "Copied"; } catch { /* select manually */ }
