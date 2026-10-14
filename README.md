@@ -29,9 +29,14 @@ when it's done.
    *Electronic & Dance → Deep House, Techno, Dubstep…*, *Hip-Hop & Rap → Trap, Drill, Melodic Rap…*,
    and K-Pop and J-Pop as separate playlists. It answers "none" when it doesn't know a song, rather
    than guessing.
-3. **A subgenre becomes its own playlist once it has 15 songs** (or already has a playlist from an
-   earlier run, so playlists don't flip between runs). Otherwise its songs go into the broad genre's
-   playlist, so a library with three techno songs gets them in *Electronic & Dance*, not a tiny playlist.
+3. **You choose the playlist style** on the preview screen (or in Settings), and can switch any time
+   without using any Groq allowance:
+   - **Main genres** (the default): one playlist per main genre, like *Electronic & Dance*. The most reliable.
+   - **Detailed subgenres**: a subgenre becomes its own playlist once it has 15 songs (or already has a
+     playlist from an earlier run, so playlists don't flip between runs); smaller ones stay in the main
+     genre's playlist. Similar styles (House and Deep House) are sometimes mixed up, and the app says so.
+   Switching to main genres empties the subgenre playlists (apps can't delete Spotify playlists);
+   switching back refills the same ones.
 4. Every answer says how sure the model is and repeats the first two words of the song's title, so
    an answer meant for a different song is caught and asked again. The model is told never to judge
    by names, a title's language or its capitals (an all-caps title isn't a sign of K-Pop).
