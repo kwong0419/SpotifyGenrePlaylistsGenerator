@@ -29,41 +29,108 @@
       <p class="small" id="own-app-hint">Not set up by the person who shared this? <button class="link" data-go="setup">Use your own Spotify app</button></p>
     </section>
 
-    <!-- Bring-your-own Client ID -->
+    <!-- Bring-your-own Client ID: a guided, one-step-at-a-time setup -->
     <section id="screen-setup" class="card" hidden>
-      <h1>One-time setup</h1>
-      <p class="lead" id="setup-why">Spotify only lets each app be used by a handful of people, so you'll create your own free Spotify app. It takes about 3 minutes.</p>
-      <p class="note">You'll need <strong>Spotify Premium</strong>. Spotify requires it for apps like this.</p>
-      <ol class="steps">
-        <li>Open the <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">Spotify Developer Dashboard</a> and log in with your normal Spotify account. If asked, accept the developer terms.</li>
-        <li>Click <strong>Create app</strong> and fill in:
-          <ul>
-            <li><strong>App name</strong> and <strong>description</strong>: anything, e.g. "Genre Sorter"</li>
-            <li><strong>Redirect URI</strong>: paste this exactly, then click <strong>Add</strong>:
-              <div class="copy-row"><code id="redirect-uri"></code><button class="secondary" id="copy-uri">Copy</button></div>
-            </li>
-            <li>Under "Which API/SDKs", tick <strong>Web API</strong></li>
-          </ul>
-          Tick the terms box and click <strong>Save</strong>.</li>
-        <li>On your new app's page, copy the <strong>Client ID</strong> and paste it here:
-          <div class="copy-row"><input id="client-id-input" placeholder="32 letters and numbers" autocomplete="off" spellcheck="false"><button class="primary" id="save-client-id">Continue</button></div>
-          <p class="error" id="client-id-error" hidden></p>
-        </li>
-      </ol>
-      <p class="small"><button class="link" data-go="welcome" id="setup-back">← Back</button></p>
+      <p class="step" id="setup-count"></p>
+      <div class="dots" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+
+      <div class="setup-step" data-step="1">
+        <h1>Set up your free Spotify app</h1>
+        <p class="lead" id="setup-why">Spotify asks everyone who uses a tool like this to create a free "developer app" first. It's a form with five boxes, and this guide walks you through each one. About 3 minutes.</p>
+        <ul class="facts">
+          <li>You'll need <strong>Spotify Premium</strong>. Spotify requires it for apps like this.</li>
+          <li>You don't need to know anything about coding. You'll only click, copy and paste.</li>
+          <li>Keep this page open. Spotify's site opens in a new tab, and you'll come back here.</li>
+        </ul>
+        <h2 class="h3">First: open Spotify's developer site</h2>
+        <a class="button primary big" href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener" id="open-dashboard">Open Spotify for Developers ↗</a>
+        <p class="small muted">Log in with your normal Spotify account. If Spotify asks you to accept its developer terms or to verify your email address, do that first, then come back to this tab.</p>
+      </div>
+
+      <div class="setup-step" data-step="2" hidden>
+        <h1>Create the app</h1>
+        <p class="lead">On Spotify's page, click <strong>Create app</strong> (top right). A form opens. Fill it in using the buttons below.</p>
+        <figure class="mock" aria-label="A simplified drawing of Spotify's Create app form">
+          <div class="mock-field"><span class="pin">1</span><span class="mock-label">App name</span><span class="mock-box"></span></div>
+          <div class="mock-field"><span class="pin">2</span><span class="mock-label">App description</span><span class="mock-box"></span></div>
+          <div class="mock-field muted"><span class="pin off">–</span><span class="mock-label">Website</span><span class="mock-box"></span><span class="mock-note">leave empty</span></div>
+          <div class="mock-field"><span class="pin">3</span><span class="mock-label">Redirect URIs</span><span class="mock-box"></span><span class="mock-btn">Add</span></div>
+          <div class="mock-field"><span class="pin">4</span><span class="mock-label">Which API/SDKs?</span><span class="mock-check">☑ Web API</span></div>
+          <div class="mock-field"><span class="pin">5</span><span class="mock-check">☑ I understand and agree…</span><span class="mock-btn primary">Save</span></div>
+          <figcaption class="small muted">A simplified drawing. Spotify's form looks a little different.</figcaption>
+        </figure>
+        <ol class="fill">
+          <li><strong>App name</strong>: <div class="copy-row"><code>Genre Sorter</code><button class="secondary" data-copy="Genre Sorter">Copy</button></div></li>
+          <li><strong>App description</strong>: <div class="copy-row"><code>Sorts my Liked Songs into genre playlists</code><button class="secondary" data-copy="Sorts my Liked Songs into genre playlists">Copy</button></div></li>
+          <li><strong>Redirect URIs</strong>: paste this, then <strong>click Add</strong> next to the box. This is the step people miss most.
+            <div class="copy-row"><code id="redirect-uri"></code><button class="secondary" id="copy-uri">Copy</button></div></li>
+          <li>Under <strong>Which API/SDKs are you planning to use?</strong>, tick <strong>Web API</strong>.</li>
+          <li>Tick the box agreeing to Spotify's terms, then click <strong>Save</strong>.</li>
+        </ol>
+      </div>
+
+      <div class="setup-step" data-step="3" hidden>
+        <h1>Copy your Client ID</h1>
+        <p class="lead">After saving, Spotify shows your new app's page. Click <strong>Settings</strong> (top right of that page).</p>
+        <figure class="mock" aria-label="A simplified drawing of the app's Basic Information page">
+          <div class="mock-title">Basic Information</div>
+          <div class="mock-field hl"><span class="pin">✓</span><span class="mock-label">Client ID</span><span class="mock-box mono">3f9a…c21e</span><span class="mock-note">copy this</span></div>
+          <div class="mock-field no"><span class="pin off">✗</span><span class="mock-label">Client secret</span><span class="mock-link">View client secret</span><span class="mock-note">not this one</span></div>
+          <figcaption class="small muted">A simplified drawing. The Client ID is a mix of 32 letters and numbers.</figcaption>
+        </figure>
+        <p>Copy the <strong>Client ID</strong>. Don't use the <em>Client secret</em>; this app never needs it.</p>
+        <label for="client-id-input"><strong>Paste your Client ID here:</strong></label>
+        <div class="copy-row"><input id="client-id-input" placeholder="32 letters and numbers" autocomplete="off" spellcheck="false"></div>
+        <p class="small" id="client-id-status" aria-live="polite"></p>
+        <p class="error" id="client-id-error" hidden></p>
+      </div>
+
+      <div class="setup-step" data-step="4" hidden>
+        <h1>Log in and allow access</h1>
+        <p class="lead">Spotify will ask whether <em>Genre Sorter</em> may see your Liked Songs and make playlists. Click <strong>Agree</strong>.</p>
+        <button class="primary big" id="save-client-id">Log in with Spotify</button>
+        <details class="help">
+          <summary>Spotify showed an error instead?</summary>
+          <dl>
+            <dt>"INVALID_CLIENT: Invalid redirect URI"</dt>
+            <dd>The Redirect URI wasn't added. In your app's <strong>Settings</strong>, click <strong>Edit</strong>, paste the Redirect URI from step 2, click <strong>Add</strong>, then <strong>Save</strong> at the bottom. Then try again.</dd>
+            <dt>"INVALID_CLIENT: Invalid client"</dt>
+            <dd>The Client ID is wrong, or it's the Client secret. <button class="link" data-setup-step="3">Go back to step 3</button> and copy the Client ID again.</dd>
+            <dt>"Something went wrong" or a blank page</dt>
+            <dd>Wait a minute (a new app can take a moment to start working), then try again.</dd>
+            <dt>It says you're not allowed, or Premium is needed</dt>
+            <dd>Log in with the same Spotify account you used to create the app, and make sure it has Premium.</dd>
+          </dl>
+        </details>
+      </div>
+
+      <div class="row between setup-nav">
+        <button class="secondary" id="setup-prev">← Back</button>
+        <button class="primary" id="setup-next">Next →</button>
+      </div>
     </section>
 
     <!-- Logged in but not on the allowlist -->
     <section id="screen-not-allowed" class="card" hidden>
       <h1>Almost there</h1>
-      <p class="lead">Spotify hasn't given this account access to the shared app yet.</p>
-      <p>Either:</p>
-      <ul class="facts">
-        <li><span id="ask-owner">Ask the person who shared this link</span> to add the email of your Spotify account under <em>User Management</em> in their Spotify developer dashboard. Then try again.</li>
-        <li>Or set up your own free Spotify app in about 3 minutes.</li>
-      </ul>
+      <div id="not-allowed-shared">
+        <p class="lead">Spotify hasn't given this account access to the shared app yet.</p>
+        <p>Either:</p>
+        <ul class="facts">
+          <li><span id="ask-owner">Ask the person who shared this link</span> to add the email of your Spotify account under <em>User Management</em> in their Spotify developer dashboard. Then try again.</li>
+          <li>Or set up your own free Spotify app in about 3 minutes.</li>
+        </ul>
+      </div>
+      <div id="not-allowed-own" hidden>
+        <p class="lead">Spotify didn't let this account use your app.</p>
+        <ul class="facts">
+          <li><strong>Is it the same account?</strong> Log in with the Spotify account you used to create the app. Spotify only lets that account (and up to 5 people you add under <em>User Management</em> in the app's settings) use it.</li>
+          <li><strong>Does it have Premium?</strong> Spotify requires Premium for apps like this.</li>
+          <li><strong>Just created the app?</strong> Wait a minute, then try again.</li>
+        </ul>
+      </div>
       <div class="row">
-        <button class="primary" data-go="setup">Set up my own app</button>
+        <button class="primary" data-go="setup">Go to the setup steps</button>
         <button class="secondary" id="retry-btn">Try again</button>
       </div>
     </section>
@@ -131,17 +198,21 @@
 
     <!-- Groq key -->
     <section id="screen-groq" class="card" hidden>
-      <h1>One more step: a free Groq key</h1>
-      <p class="lead">Spotify only lets apps look up a few artists before it blocks them, so genres are worked out by Groq, a free AI service. It reads your artist names and tags them the way Spotify would.</p>
-      <ol class="steps">
-        <li>Sign in at <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a> (free, no credit card).</li>
-        <li>Click <strong>Create API Key</strong>, give it any name, and copy it.</li>
+      <p class="step">Last setup step</p>
+      <h1>Get a free Groq key</h1>
+      <p class="lead">Groq is a free AI service that works out each song's genre. It needs a "key", a password-like code that lets this page use your free allowance. About 1 minute, no credit card.</p>
+      <ol class="fill">
+        <li>Open Groq's keys page and sign in. Signing in with Google or GitHub is fine.
+          <div class="copy-row"><a class="button primary" href="https://console.groq.com/keys" target="_blank" rel="noopener">Open Groq keys page ↗</a></div></li>
+        <li>Click <strong>Create API Key</strong>. Type any name (for example <em>Genre Sorter</em>) and confirm.</li>
+        <li>Click <strong>Copy</strong> next to the key Groq shows. Groq only shows it once, so copy it before closing that window.</li>
         <li>Paste it here:
-          <div class="copy-row"><input id="groq-key-input" placeholder="gsk_…" autocomplete="off" spellcheck="false"><button class="primary" id="save-groq-key">Continue</button></div>
+          <div class="copy-row"><input id="groq-key-input" placeholder="starts with gsk_" autocomplete="off" spellcheck="false"><button class="primary" id="save-groq-key">Continue</button></div>
+          <p class="small muted" id="groq-key-status" aria-live="polite"></p>
           <p class="error" id="groq-error" hidden></p>
         </li>
       </ol>
-      <p class="small muted">Only artist names and a few song titles are sent to Groq. Your key stays in this browser and is only ever sent to Groq.</p>
+      <p class="small muted">Lost the key or closed the window too soon? Just create another one; it's free. Only song titles and artist names are sent to Groq. Your key stays in this browser and is only ever sent to Groq.</p>
     </section>
 
     <!-- Groq daily allowance used up -->
