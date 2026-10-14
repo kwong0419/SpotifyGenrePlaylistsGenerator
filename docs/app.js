@@ -103,16 +103,48 @@ function showError(err) {
   show("error");
 }
 
-function showSetup() {
-  const shared = !!sharedClientId;
-  $("setup-why").textContent = shared
-    ? "Spotify only lets each app be used by a handful of people, so you'll create your own free Spotify app. It takes about 3 minutes."
-    : "Spotify requires a free developer app to sort your library. Creating one takes about 3 minutes.";
-  $("setup-back").hidden = !shared;
+const SETUP_STEPS = 4;
+const isClientId = (v) => /^[0-9a-f]{32}$/i.test(v);
+
+/** The guided Spotify setup, one step at a time. Picks up at the step last seen. */
+function showSetup(step = store.get("setupStep", 1)) {
   $("redirect-uri").textContent = redirectUri;
   $("client-id-input").value = store.get("clientId", "");
   $("client-id-error").hidden = true;
+  checkClientId();
+  setupStep(step);
   show("setup");
+}
+
+function setupStep(n) {
+  n = Math.min(SETUP_STEPS, Math.max(1, n));
+  store.set("setupStep", n);
+  document.querySelectorAll(".setup-step").forEach((el) => { el.hidden = +el.dataset.step !== n; });
+  document.querySelectorAll("#screen-setup .dots span").forEach((d, i) => d.classList.toggle("on", i < n));
+  $("setup-count").textContent = `Step ${n} of ${SETUP_STEPS}`;
+  // On step 1, Back returns to the welcome screen when there is a shared app to go back to.
+  $("setup-prev").hidden = n === 1 && !sharedClientId;
+  $("setup-next").hidden = n === SETUP_STEPS;
+  $("setup-next").textContent = n === 1 ? "I'm logged in →" : n === 2 ? "I clicked Save →" : "Next →";
+  if (n === 3) checkClientId();
+  else $("setup-next").disabled = false;
+  window.scrollTo(0, 0);
+}
+
+/** Checks the pasted Client ID as it's typed; Next only works once it looks right. */
+function checkClientId() {
+  const input = $("client-id-input");
+  const value = input.value.replace(/\s+/g, "");
+  if (value !== input.value) input.value = value; // stray spaces from copying
+  const ok = isClientId(value);
+  const status = $("client-id-status");
+  status.className = `small${ok ? " ok" : " muted"}`;
+  status.textContent = ok ? "✓ That looks like a Client ID."
+    : !value ? "It's on the Settings page, under Basic Information."
+    : /^https?:/i.test(value) ? "That's a web address. Copy the Client ID instead (32 letters and numbers)."
+    : `That's ${value.length} characters; a Client ID has 32 letters and numbers. Try copying it again.`;
+  if (store.get("setupStep", 1) === 3) $("setup-next").disabled = !ok;
+  return ok ? value : null;
 }
 
 // --------------------------------------------------------------------------- auth (PKCE)
@@ -175,6 +207,7 @@ async function handleLoginReturn() {
     client_id: pkce.clientId, code_verifier: pkce.verifier,
   });
   saveToken(data, pkce.clientId);
+  store.del("setupStep"); // set up and logged in: a later setup starts from the beginning
   return true;
 }
 
@@ -755,6 +788,9 @@ function showCooldown(err) {
 }
 
 function showNotAllowed() {
+  const own = !!store.get("clientId");
+  $("not-allowed-shared").hidden = own;
+  $("not-allowed-own").hidden = !own;
   $("ask-owner").textContent = CONFIG.ownerName ? `Ask ${CONFIG.ownerName}` : "Ask the person who shared this link";
   show("not-allowed");
 }
@@ -1182,18 +1218,48 @@ function wire() {
   document.querySelectorAll('input[name="playlist-style"]').forEach((r) =>
     r.addEventListener("change", () => r.checked && setPlaylistStyle(r.value)));
   $("select-none").addEventListener("click", () => { state.selected.clear(); renderPreview(); });
-  $("copy-uri").addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText(redirectUri); $("copy-uri").textContent = "Copied"; } catch { /* select manually */ }
+  const copied = async (btn, text) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      btn.textContent = "Copied ✓";
+      setTimeout(() => { btn.textContent = "Copy"; }, 2000);
+    } catch { /* select it manually */ }
+  };
+  $("copy-uri").addEventListener("click", () => copied($("copy-uri"), redirectUri));
+  document.querySelectorAll("[data-copy]").forEach((b) => b.addEventListener("click", () => copied(b, b.dataset.copy)));
+  document.querySelectorAll("[data-setup-step]").forEach((b) => b.addEventListener("click", () => setupStep(+b.dataset.setupStep)));
+  $("client-id-input").addEventListener("input", checkClientId);
+  $("groq-key-input").addEventListener("input", () => {
+    const input = $("groq-key-input");
+    const v = input.value.replace(/\s+/g, "");
+    if (v !== input.value) input.value = v;
+    const status = $("groq-key-status");
+    const ok = /^gsk_\w{20,}$/.test(v);
+    status.className = `small ${ok ? "ok" : "muted"}`;
+    status.textContent = !v ? "" : ok ? "✓ That looks like a Groq key. Click Continue."
+      : !v.startsWith("gsk_") ? "A Groq key starts with gsk_. Copy it again from Groq's page."
+      : "That looks cut short. Copy the whole key again.";
+  });
+  $("setup-prev").addEventListener("click", () => {
+    const n = store.get("setupStep", 1);
+    if (n === 1) show("welcome");
+    else setupStep(n - 1);
+  });
+  $("setup-next").addEventListener("click", () => {
+    const n = store.get("setupStep", 1);
+    if (n === 3 && !checkClientId()) return;
+    setupStep(n + 1);
   });
   $("save-client-id").addEventListener("click", () => {
-    const value = $("client-id-input").value.trim();
-    if (!/^[0-9a-f]{32}$/i.test(value)) {
-      $("client-id-error").textContent = "That doesn't look like a Client ID. It's 32 letters and numbers, shown on your app's page under Basic Information.";
+    const value = checkClientId();
+    if (!value) {
+      setupStep(3);
+      $("client-id-error").textContent = "Paste your Client ID here first.";
       $("client-id-error").hidden = false;
       return;
     }
+    if (value !== store.get("clientId")) store.del("token"); // the old login belongs to a different app
     store.set("clientId", value);
-    store.del("token"); // the old login belongs to a different app
     login();
   });
   $("refresh-genres").addEventListener("click", () => {

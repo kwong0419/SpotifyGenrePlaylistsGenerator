@@ -166,3 +166,38 @@ a.secondary-link:hover { background: var(--bg); }
 .songs li > span { min-width: 0; }
 .songs .mine { color: var(--accent); font-size: .8rem; white-space: nowrap; }
 select.move { flex: 0 0 auto; width: 9.5rem; padding: 3px 6px; font-size: .8rem; }
+
+/* Guided Spotify setup */
+a.button { display: inline-block; text-decoration: none; border-radius: 999px; padding: 9px 18px; }
+a.button.primary { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+a.button.big { padding: 14px 28px; font-size: 1.05rem; }
+.h3 { font-size: 1.05rem; margin: 1.25rem 0 .6rem; }
+.dots { display: flex; gap: 6px; margin: 0 0 1rem; }
+.dots span { height: 6px; flex: 1; border-radius: 3px; background: var(--line); }
+.dots span.on { background: var(--accent); }
+.setup-nav { margin-top: 1.5rem; border-top: 1px solid var(--line); padding-top: 14px; }
+.fill { padding-left: 1.2rem; }
+.fill > li { margin: .8rem 0; }
+.mock { margin: 1rem 0; padding: 14px; border: 1px dashed var(--line); border-radius: 10px; background: var(--bg); }
+.mock-title { font-weight: 600; margin-bottom: 8px; }
+.mock-field { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; font-size: .875rem; }
+.mock-field.muted { opacity: .55; }
+.mock-field.hl .mock-box { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.mock-field.no { opacity: .7; }
+.pin { flex: none; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: var(--accent-text);
+  font-size: .75rem; font-weight: 700; display: grid; place-items: center; }
+.pin.off { background: var(--line); color: var(--muted); }
+.mock-label { width: 130px; flex: none; }
+.mock-box { flex: 1 1 120px; height: 26px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); padding: 3px 8px; }
+.mock-box.mono { font-family: ui-monospace, Menlo, monospace; }
+.mock-btn { border: 1px solid var(--line); border-radius: 999px; padding: 2px 12px; background: var(--card); }
+.mock-btn.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; }
+.mock-link { color: var(--accent); text-decoration: underline; }
+.mock-note { color: var(--muted); font-style: italic; }
+.mock figcaption { margin-top: 8px; }
+.ok { color: var(--accent); font-weight: 500; }
+details.help { margin-top: 1.25rem; border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
+details.help summary { cursor: pointer; font-weight: 500; }
+details.help dt { font-weight: 600; margin-top: .8rem; font-family: ui-monospace, Menlo, monospace; font-size: .85rem; }
+details.help dd { margin: .25rem 0 0; }
+@media (max-width: 480px) { .mock-label { width: auto; flex-basis: 100%; } }

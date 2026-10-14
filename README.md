@@ -11,7 +11,9 @@ entirely in the visitor's browser: there's no server, and data only goes to Spot
 The first visit walks you through two one-time steps, about 5 minutes in total:
 
 1. **Your own Spotify app** (free). Spotify only lets each developer app be used by 5 people, so
-   everyone creates their own and pastes its Client ID into the page. You need **Spotify Premium**,
+   everyone creates their own and pastes its Client ID into the page. The page walks through it one
+   step at a time: a drawing of each Spotify form, a Copy button for every value to paste, a live
+   check of the pasted Client ID, and fixes for Spotify's common errors. You need **Spotify Premium**,
    because Spotify requires it for these apps.
 2. **A Groq API key** (free, no credit card) from [console.groq.com/keys](https://console.groq.com/keys).
 
